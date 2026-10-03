@@ -872,7 +872,7 @@ GlmDiagnosticModel::Outputs GlmDiagnosticModel::run_stack(
   DGPP_CUDA_OK(cudaMemcpyAsync(d_tokens_, token_ids.data(),
                                static_cast<size_t>(T) * 8,
                                cudaMemcpyHostToDevice, stream_));
-  glm_embed_bcast_streams(globals_.embed, d_tokens_, streams_[0], T, H,
+  glm_embed_bcast_streams(globals_.embed, d_tokens_, streams_[0], T, H, 4,
                           stream_);
   if (layer_inputs) {
     DGPP_CUDA_OK(cudaStreamSynchronize(stream_));

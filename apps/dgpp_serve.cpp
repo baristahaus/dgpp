@@ -396,6 +396,9 @@ struct QwenFamily final : ServeFamily {
   std::string ckpt;
   std::unique_ptr<dgpp::QwenModel> model;
   bool fp8_head_mma;
+  // The family name rides the model_type: the dense Qwen3.8-27B reports
+  // qwen3_5 in logs and /v1/models, the Flash-Next family qwen4_exp.
+  const char* family_name = "qwen4_exp";
   QwenFamily(const std::string& checkpoint, const std::optional<dgpp::RopeScaling>& rope_scaling,
              bool head_mma)
       : cfg(dgpp::QwenTextConfig::from_json_file((fs::path(checkpoint) / "config.json").string())),
@@ -405,6 +408,7 @@ struct QwenFamily final : ServeFamily {
     // engine config or CLI before the family is built); it must be on the
     // config before the binding table and the loader see it.
     cfg.mtp_experts_bf16_fused = dgpp::QwenLayerStream::mtp_experts_bf16_fused();
+    family_name = cfg.model_type == "qwen3_5_text" ? "qwen3_5" : "qwen4_exp";
     // The AutoRound hybrid ships its dense stack as block FP8: the fp8 dense
     // mode is the only one that reads it, so it is selected here whatever
     // the recipe says (docs/qwen38_autoround_int4_plan.md D4).
@@ -434,12 +438,15 @@ struct QwenFamily final : ServeFamily {
           static_cast<double>(rope_scaling->mscale()), cfg.context_limit());
     }
   }
-  const char* name() const override { return "qwen4_exp"; }
+  const char* name() const override { return family_name; }
   int64_t vocab_size() const override { return cfg.vocab_size; }
   const std::vector<int64_t>& eos_token_ids() const override { return cfg.eos_token_ids; }
   int64_t block_tokens() const override { return dgpp::QwenModel::kv_block_tokens_static(); }
   int prefill_chunk_tokens() const override { return dgpp::QwenModel::prefill_chunk_tokens(); }
   std::string pool_check(int64_t pool_tokens) const override {
+    // The compressed-key pool-id space is an indexed-QSA bound; the dense
+    // form selects every pool and needs no such budget.
+    if (!cfg.has_indexer()) return "";
     if (pool_tokens / cfg.indexer_compress_ratio >= (int64_t(1) << 21))
       return "exceeds the QSA pool-id space (2^21 pools)";
     return "";
@@ -872,7 +879,7 @@ std::unique_ptr<ServeFamily> make_family(const std::string& ckpt, int world,
   if (arch == dgpp::ModelArchitecture::DeepseekV41) return std::make_unique<Dsv41Family>(ckpt);
   if (arch == dgpp::ModelArchitecture::DeepseekV4) return std::make_unique<Dsv4Family>(ckpt);
   if (arch == dgpp::ModelArchitecture::MimoV2) return std::make_unique<MimoFamily>(ckpt, kv_format);
-  if (arch == dgpp::ModelArchitecture::Qwen4Exp)
+  if (arch == dgpp::ModelArchitecture::Qwen4Exp || arch == dgpp::ModelArchitecture::Qwen35)
     return std::make_unique<QwenFamily>(ckpt, rope_scaling, fp8_head_mma);
   if (arch == dgpp::ModelArchitecture::Glm4Moe) return std::make_unique<Glm4Family>(ckpt);
   if (arch == dgpp::ModelArchitecture::GlmMoeDsa) return std::make_unique<GlmDsaFamily>(ckpt, world, kv_format);

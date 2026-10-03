@@ -13,6 +13,7 @@ namespace dgpp {
 enum class ModelArchitecture : int {
   Glm5,     // Glm5ForConditionalGeneration / glm5_next (GLM-5.3-Flash)
   Qwen4Exp, // Qwen4ExpForConditionalGeneration / qwen4_exp (Qwen3.8-Flash-Next)
+  Qwen35,   // Qwen3_5ForConditionalGeneration / qwen3_5 (Qwen3.8-27B, dense)
   Glm4Moe,  // Glm4MoeForCausalLM / glm4_moe (GLM-4.7, 2026-09-09)
   GlmMoeDsa, // GlmMoeDsaForCausalLM / glm_moe_dsa (full GLM-5.3, 2026-09-12)
   DeepseekV41, // DeepseekV41ForCausalLM / deepseek_v41 (DeepSeek-V4.1-Flash, 2026-09-13)
@@ -23,6 +24,7 @@ enum class ModelArchitecture : int {
 constexpr const char* model_architecture_name(ModelArchitecture a) {
   switch (a) {
     case ModelArchitecture::Qwen4Exp: return "qwen4_exp";
+    case ModelArchitecture::Qwen35: return "qwen3_5";
     case ModelArchitecture::Glm4Moe: return "glm4_moe";
     case ModelArchitecture::GlmMoeDsa: return "glm_moe_dsa";
     case ModelArchitecture::Glm5: return "glm5";

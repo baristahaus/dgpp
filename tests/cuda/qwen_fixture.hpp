@@ -101,6 +101,35 @@ inline const char* tiny_gptq_quant_json() {
               "-:.*\\.ple\\..*": {}, "-:.*embed.*": {}, "-:.*fc_hidden.*": {}, "-:.*\\.gate$": {}}})json";
 }
 
+// The dense Qwen3.8-27B's tiny twin (docs/qwen38_27b_dense_plan.md): the
+// same GDN/full-attention hybrid and MTP draft, with the plain residual
+// (no hc_* keys — the per-site LayerNorm pairs and the model's final norm
+// come back), select-all attention (no indexer), the dense SwiGLU MLP and
+// the swish output gate. The BF16 release: no quantization_config at all.
+// Norm weights ride the (1+w) parameterization like the Flash-Next
+// family's (the release stores ~0.2-magnitude offsets; the 27B's
+// input_layernorm heads 0.18-0.29), so the fixture's norm buckets apply
+// unchanged.
+inline const char* tiny_dense_text_json() {
+  return R"json({
+  "model_type": "qwen3_5_text", "attention_bias": false,
+  "bos_token_id": 1, "eos_token_id": 1,
+  "head_dim": 256, "hidden_act": "silu", "hidden_size": 256,
+  "intermediate_size": 64,
+  "layer_types": ["linear_attention", "linear_attention", "full_attention", "linear_attention"],
+  "linear_conv_kernel_dim": 4, "linear_key_head_dim": 128, "linear_num_key_heads": 4,
+  "linear_num_value_heads": 12, "linear_value_head_dim": 128,
+  "mamba_ssm_dtype": "float32", "max_position_embeddings": 4096,
+  "mtp_num_hidden_layers": 1, "mtp_use_dedicated_embeddings": false,
+  "num_attention_heads": 4, "num_hidden_layers": 4, "num_key_value_heads": 2,
+  "output_gate_type": "swish",
+  "rms_norm_eps": 1e-06,
+  "rope_parameters": {"mrope_interleaved": true, "mrope_section": [11, 11, 10],
+                      "partial_rotary_factor": 0.25, "rope_theta": 10000000, "rope_type": "default"},
+  "tie_word_embeddings": false, "vocab_size": 512
+})json";
+}
+
 inline QwenTextConfig tiny_config() {
   const auto t = dgpp::minijson::parse(tiny_text_json());
   const auto q = dgpp::minijson::parse(tiny_quant_json());
@@ -117,6 +146,11 @@ inline QwenTextConfig tiny_gptq_config() {
   const auto t = dgpp::minijson::parse(tiny_gptq_text_json());
   const auto q = dgpp::minijson::parse(tiny_gptq_quant_json());
   return QwenTextConfig::parse(t.root, &q.root);
+}
+
+inline QwenTextConfig tiny_dense_config() {
+  const auto t = dgpp::minijson::parse(tiny_dense_text_json());
+  return QwenTextConfig::parse(t.root, nullptr);  // the BF16 release
 }
 
 inline bool has(const std::string& name, const char* needle) {
@@ -214,11 +248,17 @@ inline void write_fixture(const QwenTextConfig& cfg, const std::string& dir,
                           const std::vector<QwenExpectedTensor>& extra_tensors);
 
 // Writes `dir` for `cfg` with the json the config's forms came from: the
-// FP8 release's (the default), the NVFP4 release's, or the AutoRound hybrid's.
+// FP8 release's (the default), the NVFP4 release's, the AutoRound hybrid's,
+// or the dense 27B's (BF16, no quantization_config).
 inline void write_fixture_for(const QwenTextConfig& cfg, const std::string& dir) {
-  if (cfg.experts_gptq_int4) write_fixture(cfg, dir, tiny_gptq_text_json(), tiny_gptq_quant_json(), {});
-  else if (cfg.experts_nvfp4) write_fixture(cfg, dir, tiny_text_json(), tiny_nvfp4_quant_json(), {});
-  else write_fixture(cfg, dir, tiny_text_json(), tiny_quant_json(), {});
+  if (cfg.model_type == "qwen3_5_text")
+    write_fixture(cfg, dir, tiny_dense_text_json(), nullptr, {});
+  else if (cfg.experts_gptq_int4)
+    write_fixture(cfg, dir, tiny_gptq_text_json(), tiny_gptq_quant_json(), {});
+  else if (cfg.experts_nvfp4)
+    write_fixture(cfg, dir, tiny_text_json(), tiny_nvfp4_quant_json(), {});
+  else
+    write_fixture(cfg, dir, tiny_text_json(), tiny_quant_json(), {});
 }
 
 // The engine test's fixture config: DGPP_TEST_QWEN_GPTQ=1 selects the
@@ -245,9 +285,17 @@ inline void write_fixture(const QwenTextConfig& cfg, const std::string& dir,
     const fs::path p = root / "config.json";
     std::FILE* f = std::fopen(p.c_str(), "wb");
     if (!f) throw std::runtime_error("cannot write config.json");
-    const std::string json = std::string("{\"architectures\":[\"Qwen4ExpForConditionalGeneration\"],"
-                                         "\"model_type\":\"qwen4_exp\",\"text_config\":") +
-                             text_json + ",\"quantization_config\":" + quant_json + "}";
+    // The dense 27B release carries no quantization_config (BF16); the
+    // Flash-Next forms carry the one their config's tensors came from.
+    std::string json;
+    if (cfg.model_type == "qwen3_5_text")
+      json = std::string("{\"architectures\":[\"Qwen3_5ForConditionalGeneration\"],"
+                         "\"model_type\":\"qwen3_5\",\"text_config\":") +
+             text_json + "}";
+    else
+      json = std::string("{\"architectures\":[\"Qwen4ExpForConditionalGeneration\"],"
+                         "\"model_type\":\"qwen4_exp\",\"text_config\":") +
+             text_json + ",\"quantization_config\":" + quant_json + "}";
     std::fwrite(json.data(), 1, json.size(), f);
     std::fclose(f);
   }

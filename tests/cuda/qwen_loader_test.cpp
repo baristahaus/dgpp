@@ -154,6 +154,45 @@ void expect_device_equals(const void* dev, const std::vector<uint8_t>& want, con
   require(got == want, what + ": resident bytes differ from the checkpoint slice");
 }
 
+// A GDN layer's resident: the q | k | v segments (in_proj_qkv and conv),
+// z, a and b, the F32-widened A_log / dt_bias, the norm and the out_proj
+// column slice — the same formulas in the Flash-Next and the dense forms.
+void check_gdn(const Fixture& fx, const QwenLayerStream& s, const dgpp::QwenLayerResident& r,
+               const std::string& tag) {
+  const QwenTextConfig& cfg = fx.cfg;
+  const dgpp::QwenLocalGeometry& g = s.geometry();
+  const int rank = s.rank();
+  const std::string gp = dgpp::qwen_layer_prefix(cfg, r.layer) + "linear_attn.";
+  const size_t H2 = static_cast<size_t>(cfg.hidden_size) * 2;
+  const int64_t dk = cfg.gdn_key_head_dim, dv = cfg.gdn_value_head_dim;
+  const int64_t K = static_cast<int64_t>(cfg.gdn_key_heads) * dk;
+  const int64_t lk = g.local_key_heads, lv = g.local_value_heads;
+  const std::vector<uint8_t> qkv = fx.bytes(gp + "in_proj_qkv.weight");
+  std::vector<uint8_t> want = host_rows(qkv, H2, rank * lk * dk, lk * dk);
+  auto k = host_rows(qkv, H2, K + rank * lk * dk, lk * dk);
+  auto v = host_rows(qkv, H2, 2 * K + rank * lv * dv, lv * dv);
+  want.insert(want.end(), k.begin(), k.end());
+  want.insert(want.end(), v.begin(), v.end());
+  expect_device_equals(r.gdn.in_proj_qkv, want, tag + "gdn qkv segments");
+  const size_t cw = static_cast<size_t>(cfg.gdn_conv_width) * 2;
+  const std::vector<uint8_t> conv = fx.bytes(gp + "conv1d.weight");
+  want = host_rows(conv, cw, rank * lk * dk, lk * dk);
+  k = host_rows(conv, cw, K + rank * lk * dk, lk * dk);
+  v = host_rows(conv, cw, 2 * K + rank * lv * dv, lv * dv);
+  want.insert(want.end(), k.begin(), k.end());
+  want.insert(want.end(), v.begin(), v.end());
+  expect_device_equals(r.gdn.conv, want, tag + "gdn conv segments");
+  expect_device_equals(r.gdn.in_proj_z, host_rows(fx.bytes(gp + "in_proj_z.weight"), H2, rank * lv * dv, lv * dv), tag + "gdn z");
+  expect_device_equals(r.gdn.in_proj_a, host_rows(fx.bytes(gp + "in_proj_a.weight"), H2, rank * lv, lv), tag + "gdn a");
+  expect_device_equals(r.gdn.in_proj_b, host_rows(fx.bytes(gp + "in_proj_b.weight"), H2, rank * lv, lv), tag + "gdn b");
+  expect_device_equals(r.gdn.a_log, widened_f32(fx.bytes(gp + "A_log"), rank * lv, lv), tag + "gdn A_log");
+  expect_device_equals(r.gdn.dt_bias, widened_f32(fx.bytes(gp + "dt_bias"), rank * lv, lv), tag + "gdn dt_bias");
+  expect_device_equals(r.gdn.norm, fx.bytes(gp + "norm.weight"), tag + "gdn norm");
+  const int64_t V = static_cast<int64_t>(cfg.gdn_value_heads) * dv;
+  expect_device_equals(r.gdn.out_proj, host_cols(fx.bytes(gp + "out_proj.weight"), cfg.hidden_size, V * 2, rank * lv * dv * 2, lv * dv * 2), tag + "gdn out_proj cols");
+  require(r.gdn.local_key_heads == lk && r.gdn.local_value_heads == lv, tag + "gdn head counts");
+}
+
 // The expected re-blocked F32 scale grid of a sliced quantized matrix.
 std::vector<uint8_t> reblocked_scales(const std::vector<uint8_t>& src_bf16, int64_t src_cols,
                                       bool row_slice, int64_t start, int64_t count, int sb) {
@@ -195,34 +234,7 @@ void check_layer(const Fixture& fx, const QwenLayerStream& s, const dgpp::QwenLa
     expect_device_equals(gr->inject, fx.bytes(gp + "block_inject_weight.weight"), tag + "gr inject");
   }
   if (r.kind == dgpp::QwenLayerKind::Gdn) {
-    const std::string gp = p + "linear_attn.";
-    const int64_t dk = cfg.gdn_key_head_dim, dv = cfg.gdn_value_head_dim;
-    const int64_t K = static_cast<int64_t>(cfg.gdn_key_heads) * dk;
-    const int64_t lk = g.local_key_heads, lv = g.local_value_heads;
-    const std::vector<uint8_t> qkv = fx.bytes(gp + "in_proj_qkv.weight");
-    std::vector<uint8_t> want = host_rows(qkv, H2, rank * lk * dk, lk * dk);
-    auto k = host_rows(qkv, H2, K + rank * lk * dk, lk * dk);
-    auto v = host_rows(qkv, H2, 2 * K + rank * lv * dv, lv * dv);
-    want.insert(want.end(), k.begin(), k.end());
-    want.insert(want.end(), v.begin(), v.end());
-    expect_device_equals(r.gdn.in_proj_qkv, want, tag + "gdn qkv segments");
-    const size_t cw = static_cast<size_t>(cfg.gdn_conv_width) * 2;
-    const std::vector<uint8_t> conv = fx.bytes(gp + "conv1d.weight");
-    want = host_rows(conv, cw, rank * lk * dk, lk * dk);
-    k = host_rows(conv, cw, K + rank * lk * dk, lk * dk);
-    v = host_rows(conv, cw, 2 * K + rank * lv * dv, lv * dv);
-    want.insert(want.end(), k.begin(), k.end());
-    want.insert(want.end(), v.begin(), v.end());
-    expect_device_equals(r.gdn.conv, want, tag + "gdn conv segments");
-    expect_device_equals(r.gdn.in_proj_z, host_rows(fx.bytes(gp + "in_proj_z.weight"), H2, rank * lv * dv, lv * dv), tag + "gdn z");
-    expect_device_equals(r.gdn.in_proj_a, host_rows(fx.bytes(gp + "in_proj_a.weight"), H2, rank * lv, lv), tag + "gdn a");
-    expect_device_equals(r.gdn.in_proj_b, host_rows(fx.bytes(gp + "in_proj_b.weight"), H2, rank * lv, lv), tag + "gdn b");
-    expect_device_equals(r.gdn.a_log, widened_f32(fx.bytes(gp + "A_log"), rank * lv, lv), tag + "gdn A_log");
-    expect_device_equals(r.gdn.dt_bias, widened_f32(fx.bytes(gp + "dt_bias"), rank * lv, lv), tag + "gdn dt_bias");
-    expect_device_equals(r.gdn.norm, fx.bytes(gp + "norm.weight"), tag + "gdn norm");
-    const int64_t V = static_cast<int64_t>(cfg.gdn_value_heads) * dv;
-    expect_device_equals(r.gdn.out_proj, host_cols(fx.bytes(gp + "out_proj.weight"), cfg.hidden_size, V * 2, rank * lv * dv * 2, lv * dv * 2), tag + "gdn out_proj cols");
-    require(r.gdn.local_key_heads == lk && r.gdn.local_value_heads == lv, tag + "gdn head counts");
+    check_gdn(fx, s, r, tag);
   } else {
     const std::string ap = p + "self_attn.";
     const int64_t d = cfg.head_dim;
@@ -343,6 +355,102 @@ DGPP_TEST(qwen_loader_globals_and_ngram_table_slices) {
       require(t.row_begin == rb && t.rows == re - rb, "table slice range");
       expect_device_equals(t.rows_e4m3, host_rows(table, static_cast<size_t>(ng.head_dim), rb, re - rb), "table rows");
       require(t.bytes == QwenLayerStream::ngram_table_bytes(fx.cfg, rank, world), "table bytes formula");
+    }
+  }
+}
+
+// The dense Qwen3.8-27B form (docs/qwen38_27b_dense_plan.md §2): the
+// per-site LayerNorm pairs replace the GR sites and replicate verbatim,
+// the GDN slices exactly as the Flash-Next family's, the attention layers
+// ship no indexer, the SwiGLU MLP slices by intermediate rows and columns,
+// the source-byte plan equals the bytes read, and the globals carry the
+// model's final norm plus the fused draft fc split into the two [H, H]
+// halves the Flash-Next release ships separately.
+void check_dense_layer(const Fixture& fx, const QwenLayerStream& s,
+                       const dgpp::QwenLayerResident& r) {
+  const QwenTextConfig& cfg = fx.cfg;
+  const dgpp::QwenLocalGeometry& g = s.geometry();
+  const int world = s.world(), rank = s.rank();
+  const std::string p = dgpp::qwen_layer_prefix(cfg, r.layer);
+  const size_t H2 = static_cast<size_t>(cfg.hidden_size) * 2;
+  const std::string tag = "dense world " + std::to_string(world) + " rank " + std::to_string(rank) +
+                          " layer " + std::to_string(r.layer) + " ";
+  // The plain residual: the LayerNorm pair verbatim, no GR sites.
+  expect_device_equals(r.ln_in, fx.bytes(p + "input_layernorm.weight"), tag + "input_layernorm");
+  expect_device_equals(r.ln_post, fx.bytes(p + "post_attention_layernorm.weight"),
+                       tag + "post_attention_layernorm");
+  require(r.attn_gr.hc_norm == nullptr && r.mlp_gr.hc_norm == nullptr, tag + "no gated-residual sites");
+  if (r.kind == dgpp::QwenLayerKind::Gdn) {
+    check_gdn(fx, s, r, tag);
+  } else {
+    const std::string ap = p + "self_attn.";
+    const int64_t d = cfg.head_dim;
+    expect_device_equals(r.qsa.q_proj, host_rows(fx.bytes(ap + "q_proj.weight"), H2, g.head_begin * 2 * d, g.local_heads * 2 * d), tag + "qsa q rows");
+    expect_device_equals(r.qsa.k_proj, host_rows(fx.bytes(ap + "k_proj.weight"), H2, g.kv_head_begin * d, g.local_kv_heads * d), tag + "qsa k rows");
+    expect_device_equals(r.qsa.v_proj, host_rows(fx.bytes(ap + "v_proj.weight"), H2, g.kv_head_begin * d, g.local_kv_heads * d), tag + "qsa v rows");
+    const int64_t Q = static_cast<int64_t>(cfg.num_attention_heads) * d;
+    expect_device_equals(r.qsa.o_proj, host_cols(fx.bytes(ap + "o_proj.weight"), cfg.hidden_size, Q * 2, g.head_begin * d * 2, g.local_heads * d * 2), tag + "qsa o cols");
+    expect_device_equals(r.qsa.q_norm, fx.bytes(ap + "q_norm.weight"), tag + "q_norm");
+    expect_device_equals(r.qsa.k_norm, fx.bytes(ap + "k_norm.weight"), tag + "k_norm");
+    // Select-all: no indexer tensors, none resident.
+    require(r.qsa.index_qk_proj == nullptr && r.qsa.index_q_norm == nullptr &&
+                r.qsa.index_k_norm == nullptr,
+            tag + "no indexer");
+    if (world > cfg.num_key_value_heads)
+      require(r.qsa.kv_head_begin == rank / (world / cfg.num_key_value_heads), tag + "kv pairing");
+  }
+  // The dense SwiGLU: gate/up by intermediate rows, down by columns.
+  const int64_t I = g.local_inter;
+  require(r.mlp.local_inter == I, tag + "mlp local width");
+  expect_device_equals(r.mlp.gate, host_rows(fx.bytes(p + "mlp.gate_proj.weight"), H2, rank * I, I), tag + "mlp gate rows");
+  expect_device_equals(r.mlp.up, host_rows(fx.bytes(p + "mlp.up_proj.weight"), H2, rank * I, I), tag + "mlp up rows");
+  expect_device_equals(r.mlp.down, host_cols(fx.bytes(p + "mlp.down_proj.weight"), cfg.hidden_size, cfg.intermediate_size * 2, rank * I * 2, I * 2), tag + "mlp down cols");
+  require(r.moe.router == nullptr, tag + "no router");
+  require(r.bytes == QwenLayerStream::layer_bytes(cfg, r.layer, rank, world), tag + "layer bytes formula");
+}
+
+DGPP_TEST(qwen_loader_dense_form_slices_and_globals) {
+  Fixture fx;
+  fx.cfg = qwenfx::tiny_dense_config();
+  fx.dir = (fs::current_path() / "qwen_loader_dense_fixture").string();
+  qwenfx::write_fixture_for(fx.cfg, fx.dir);
+  fx.table = dgpp::qwen_expected_text_tensors(fx.cfg);
+  const int layers = fx.cfg.num_hidden_layers + 1;
+  for (const int world : {1, 2, 4}) {
+    for (int rank = 0; rank < world; ++rank) {
+      QwenLayerStream s(fx.cfg, fx.dir, rank, world, dgpp::QwenResidency::Streaming,
+                        world > 1 ? dgpp::QwenHeadSharding::VocabSharded : dgpp::QwenHeadSharding::Full,
+                        /*resident_mtp=*/true);
+      for (int l = 0; l < layers; ++l) {
+        const uint64_t before = s.source_bytes_read();
+        const auto& r = s.load_layer(l);
+        check_dense_layer(fx, s, r);
+        require(s.source_bytes_read() - before ==
+                    QwenLayerStream::planned_layer_source_bytes(fx.cfg, l, rank, world),
+                "dense: the source-byte plan equals the bytes read");
+        s.release_layer();
+      }
+      const auto& g = s.load_globals();
+      const size_t H2 = static_cast<size_t>(fx.cfg.hidden_size) * 2;
+      expect_device_equals(g.embed, fx.bytes("model.language_model.embed_tokens.weight"), "dense embed");
+      expect_device_equals(g.lm_head, host_rows(fx.bytes("lm_head.weight"), H2, g.lm_vocab_begin, g.lm_vocab_count), "dense lm head slice");
+      // The plain-residual globals: the final norm, no mixer.
+      expect_device_equals(g.final_norm, fx.bytes("model.language_model.norm.weight"), "dense final norm");
+      require(g.mixer.hc_norm == nullptr && g.mixer.down == nullptr, "dense: no mixer");
+      // The fused draft fc [H, 2H] split at load into the two halves.
+      expect_device_equals(g.mtp_fc_embedding,
+                           host_cols(fx.bytes("mtp.fc.weight"), fx.cfg.hidden_size, 2 * H2, 0, H2),
+                           "dense mtp fc_embedding half");
+      expect_device_equals(g.mtp_fc_hidden,
+                           host_cols(fx.bytes("mtp.fc.weight"), fx.cfg.hidden_size, 2 * H2, H2, H2),
+                           "dense mtp fc_hidden half");
+      expect_device_equals(g.mtp_pre_fc_norm_embedding, fx.bytes("mtp.pre_fc_norm_embedding.weight"), "dense mtp pre_fc_norm_embedding");
+      expect_device_equals(g.mtp_pre_fc_norm_hidden, fx.bytes("mtp.pre_fc_norm_hidden.weight"), "dense mtp pre_fc_norm_hidden");
+      expect_device_equals(g.mtp_norm, fx.bytes("mtp.norm.weight"), "dense mtp norm");
+      require(g.mtp_mixer.hc_norm == nullptr, "dense: no draft mixer");
+      require(g.bytes == QwenLayerStream::globals_bytes(fx.cfg, rank, world,
+                       world > 1 ? dgpp::QwenHeadSharding::VocabSharded : dgpp::QwenHeadSharding::Full),
+              "dense globals formula");
     }
   }
 }

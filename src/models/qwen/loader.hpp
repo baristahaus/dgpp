@@ -132,15 +132,32 @@ struct QwenPleResident {
   int64_t rows = 0;
 };
 
+// The dense form's SwiGLU MLP (the Qwen3.8-27B, docs/qwen38_27b_dense_plan.md
+// §2): gate/up sliced by intermediate rows, down by intermediate columns —
+// the shared expert's shapes at the full 17408 width.
+struct QwenMlpResident {
+  const uint16_t* gate = nullptr;  // BF16 [I/W, hidden]
+  const uint16_t* up = nullptr;    // BF16 [I/W, hidden]
+  const uint16_t* down = nullptr;  // BF16 [hidden, I/W] (packed columns)
+  GlmQuantMatrix fp8[3];           // dense_weights fp8: the same three
+  int64_t local_inter = 0;         // I/W
+};
+
 struct QwenLayerResident {
   int layer = -1;
   QwenLayerKind kind = QwenLayerKind::Gdn;
   bool has_ple = false;
   QwenGrResident attn_gr;
   QwenGrResident mlp_gr;
+  // The plain-residual form (the dense 27B): the per-site LayerNorm pair
+  // stands in for the gated-residual sites; the walk's residual stream is
+  // the hidden itself (hyper_width() == hidden_size).
+  const uint16_t* ln_in = nullptr;    // BF16 [hidden] (input_layernorm)
+  const uint16_t* ln_post = nullptr;  // BF16 [hidden] (post_attention_layernorm)
   QwenGdnResident gdn;  // GDN layers
   QwenQsaResident qsa;  // QSA layers (the draft layer too)
   QwenMoeResident moe;
+  QwenMlpResident mlp;  // the dense form's SwiGLU
   QwenPleResident ple;  // the PLE layer only
   size_t bytes = 0;
 };
@@ -158,6 +175,10 @@ struct QwenGlobalsResident {
   int lm_vocab_begin = 0;
   int lm_vocab_count = 0;
   QwenGrResident mixer;               // the final read (no inject)
+  // The plain-residual form (the dense 27B): the final norm stands in for
+  // the mixer, and the draft carries its own.
+  const uint16_t* final_norm = nullptr;  // BF16 [hidden] (model...norm.weight)
+  const uint16_t* mtp_norm = nullptr;    // BF16 [hidden] (mtp.norm.weight)
   // The draft head (when the draft layer exists).
   const uint16_t* mtp_fc_embedding = nullptr;         // BF16 [hidden, hidden]
   const uint16_t* mtp_fc_hidden = nullptr;            // BF16 [hidden, hidden]

@@ -253,6 +253,101 @@ DGPP_TEST(qwen_config_parses_the_landed_checkpoint_when_present) {
     require(c.num_hidden_layers == 48 && c.num_experts == 512 && c.ple_layer() == 1, "the file's shape");
     require(c.ngram_geometry().padded_rows == 320001536, "the file's n-gram rows");
   }
+  // The dense 27B on the model share (the port's target): the text config
+  // parses text-only — the release's vision tower is skipped, the image
+  // tokens stay unset and image content is refused at request validation.
+  const fs::path nfs = "/nfs/models--Qwen--Qwen3.8-27B/snapshots";
+  if (!fs::is_directory(nfs)) return;
+  for (const auto& snap : fs::directory_iterator(nfs)) {
+    const fs::path cfg = snap.path() / "config.json";
+    if (!fs::exists(cfg)) continue;
+    require(dgpp::detect_architecture_file(cfg.string()) == dgpp::ModelArchitecture::Qwen35,
+            "the dense 27B's architecture");
+    const dgpp::QwenTextConfig c = dgpp::QwenTextConfig::from_json_file(cfg.string());
+    require(c.num_hidden_layers == 64 && c.hidden_size == 5120 && !c.has_moe() &&
+                !c.has_gr() && !c.has_indexer() && c.intermediate_size == 17408,
+            "the dense file's shape");
+    require(!c.vision.has_value(), "the tower is not served (text-only)");
+  }
+}
+
+DGPP_TEST(qwen_config_parses_the_dense_27b) {
+  // The official Qwen/Qwen3.8-27B release's text_config, transcribed
+  // (2026-10-03, docs/qwen38_27b_dense_plan.md §1): a plain residual, no
+  // indexer, a dense SwiGLU MLP, the swish output gate, no quantization.
+  const char* kDense = R"({
+  "model_type": "qwen3_5_text", "attention_bias": false, "attention_dropout": 0.0,
+  "attn_output_gate": true, "bos_token_id": 248044, "eos_token_id": 248044,
+  "full_attention_interval": 4, "head_dim": 256, "hidden_act": "silu",
+  "hidden_size": 5120, "intermediate_size": 17408,
+  "layer_types": [DLAYERS],
+  "linear_conv_kernel_dim": 4, "linear_key_head_dim": 128, "linear_num_key_heads": 16,
+  "linear_num_value_heads": 48, "linear_value_head_dim": 128,
+  "mamba_ssm_dtype": "float32", "max_position_embeddings": 262144,
+  "mtp_num_hidden_layers": 1, "mtp_use_dedicated_embeddings": false,
+  "num_attention_heads": 24, "num_hidden_layers": 64, "num_key_value_heads": 4,
+  "output_gate_type": "swish", "pad_token_id": null, "partial_rotary_factor": 0.25,
+  "rms_norm_eps": 1e-06,
+  "rope_parameters": {"mrope_interleaved": true, "mrope_section": [11, 11, 10],
+                      "partial_rotary_factor": 0.25, "rope_theta": 10000000, "rope_type": "default"},
+  "tie_word_embeddings": false, "use_cache": true, "vocab_size": 248320
+})";
+  std::string layers;
+  for (int i = 0; i < 64; ++i) {
+    if (i) layers += ", ";
+    layers += (i + 1) % 4 == 0 ? "\"full_attention\"" : "\"linear_attention\"";
+  }
+  std::string s = kDense;
+  s.replace(s.find("[DLAYERS]"), 9, "[" + layers + "]");
+  std::string text = s;
+  const auto patch = [&](const std::string& from, const std::string& to) {
+    text = s;
+    const size_t at = text.find(from);
+    require(at != std::string::npos, "dense patch anchor missing: " + from);
+    text.replace(at, from.size(), to);
+  };
+  // The BF16 release parses with no quantization_config at all.
+  const auto t = dgpp::minijson::parse(text);
+  const dgpp::QwenTextConfig c = dgpp::QwenTextConfig::parse(t.root, nullptr);
+  require(c.model_type == "qwen3_5_text", "model_type");
+  require(c.num_hidden_layers == 64 && c.hidden_size == 5120, "shape");
+  require(c.num_gdn_layers() == 48 && c.num_qsa_layers() == 16, "48 GDN + 16 QSA");
+  require(!c.has_gr() && c.hyper_width() == 5120, "plain residual; W collapses to H");
+  require(!c.has_indexer(), "select-all attention");
+  require(!c.has_moe() && c.intermediate_size == 17408, "the dense SwiGLU MLP");
+  require(c.gdn_gate_swish(), "the swish output gate");
+  require(!c.experts_fp8 && !c.experts_nvfp4 && !c.experts_gptq_int4, "the BF16 release");
+  require(c.mtp_layer() == 64, "the draft layer index");
+  require(c.rotary_dim == 64 && c.rope_theta == 1e7, "rope");
+  require(c.mrope_section.size() == 3 && c.mrope_interleaved, "mrope");
+  require(c.eos_token_ids.size() == 1 && c.eos_token_ids[0] == 248044, "eos");
+  require(c.ple_layer() == -1 && c.ngram_geometry().heads == 0, "no PLE");
+  // Refused by name: a routed MoE under the dense family, a quantized
+  // release, and the Flash-Next family losing its required sections.
+  patch("\"intermediate_size\": 17408,", "\"intermediate_size\": 17408, \"num_experts\": 8,");
+  require(refusal(text).find("dense release") != std::string::npos,
+          "a qwen3_5 MoE refused");
+  patch("\"intermediate_size\": 17408,", "\"intermediate_size\": 17407,");
+  require(refusal(text).find("intermediate_size") != std::string::npos,
+          "a non-multiple-of-8 MLP width refused");
+  require(refusal(s, kQuant).find("BF16 release") != std::string::npos,
+          "a quantized qwen3_5 release refused");
+  require(refusal(text_json("\"hc_count\": 4", "\"hc_count\": 0"))
+              .find("hyper-connected") != std::string::npos,
+          "the Flash-Next family requires its gated residual");
+  require(refusal(text_json("\"indexer_n_heads\": 4, ", "")).find("indexed") != std::string::npos,
+          "the Flash-Next family requires its indexer");
+  require(refusal(text_json("\"num_experts\": 512, ", "")).find("routed") != std::string::npos,
+          "the Flash-Next family requires its routed experts");
+  // A gated-residual qwen3_5 (not shipped, but the kernels implement it)
+  // parses and validates like the Flash-Next family's.
+  patch("\"hidden_size\": 5120,", "\"hidden_size\": 5120, \"hc_count\": 4, \"hc_lowrank\": 320,");
+  const auto g = dgpp::minijson::parse(text);
+  const dgpp::QwenTextConfig gr = dgpp::QwenTextConfig::parse(g.root, nullptr);
+  require(gr.has_gr() && gr.hyper_width() == 20480, "a hyper-connected dense config");
+  patch("\"hidden_size\": 5120,", "\"hidden_size\": 5120, \"hc_count\": 3, \"hc_lowrank\": 320,");
+  require(refusal(text).find("hc_count") != std::string::npos,
+          "the 3-branch refusal holds under qwen3_5 too");
 }
 
 DGPP_TEST(architecture_detection_names_the_families) {
@@ -260,6 +355,8 @@ DGPP_TEST(architecture_detection_names_the_families) {
   require(dgpp::detect_architecture(glm.root) == dgpp::ModelArchitecture::Glm5, "glm");
   const auto qwen = dgpp::minijson::parse(R"({"architectures": ["Qwen4ExpForConditionalGeneration"], "model_type": "qwen4_exp"})");
   require(dgpp::detect_architecture(qwen.root) == dgpp::ModelArchitecture::Qwen4Exp, "qwen");
+  const auto dense = dgpp::minijson::parse(R"({"architectures": ["Qwen3_5ForConditionalGeneration"], "model_type": "qwen3_5"})");
+  require(dgpp::detect_architecture(dense.root) == dgpp::ModelArchitecture::Qwen35, "the dense 27B");
   bool refused = false;
   try {
     const auto other = dgpp::minijson::parse(R"({"architectures": ["LlamaForCausalLM"]})");

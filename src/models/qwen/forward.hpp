@@ -325,6 +325,14 @@ class QwenModel : public SessionModel<QwenModel> {
 
   // Layer objects (built at first use, rebound per layer).
   std::unique_ptr<QwenGrSite> attn_gr_, mlp_gr_, mixer_;
+  // The plain-residual form (the dense 27B): the same two sites + the final
+  // read as QwenPlainSite, and the layer's SwiGLU MLP. The walk composes
+  // through the QwenResidualSite pointers.
+  std::unique_ptr<QwenPlainSite> attn_plain_, mlp_plain_, mixer_plain_;
+  QwenResidualSite* attn_site_ = nullptr;
+  QwenResidualSite* mlp_site_ = nullptr;
+  QwenResidualSite* mixer_site_ = nullptr;
+  std::unique_ptr<QwenDenseMlp> mlp_;
   std::unique_ptr<QwenGdnLayer> gdn_;
   std::unique_ptr<QwenQsaLayer> qsa_;
   std::unique_ptr<QwenMoeLayer> moe_;
@@ -388,7 +396,7 @@ class QwenModel : public SessionModel<QwenModel> {
   void prefetch_gr(const QwenGrResident& g, bool inject);
   void prefetch_ffn_side(const QwenLayerResident& r);
   void prefetch_attention_side(int layer);
-  void prefetch_head(const QwenGrResident& mixer);
+  void prefetch_head(const QwenGrResident& mixer, const uint16_t* plain_norm = nullptr);
   void prefetch_add(const char* what, const void* p, size_t bytes);
   // A bf16 matmul weight into the open window: the bytes the walk's launch
   // streams — its packed companion's when the GEMM holds one.
@@ -409,6 +417,8 @@ class QwenModel : public SessionModel<QwenModel> {
   uint16_t* mtp_enc_ = nullptr;         // [M, W] fc_hidden per branch
   uint16_t* mtp_r_ = nullptr;           // [M, W] the block's hyper state
   std::unique_ptr<QwenGrSite> mtp_mixer_;
+  std::unique_ptr<QwenPlainSite> mtp_mixer_plain_;
+  QwenResidualSite* mtp_mixer_site_ = nullptr;
 };
 
 }  // namespace dgpp

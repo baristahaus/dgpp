@@ -23,10 +23,12 @@ void qwen_group_rmsnorm_bf16(const void* x, const void* weight, void* y,
                              int64_t rows, int groups, int group_dim, float eps,
                              cudaStream_t stream);
 
-// The GDN output norm: y = bf16(bf16(bf16(x * rstd) * w) * sigmoid(gate)),
+// The GDN output norm: y = bf16(bf16(bf16(x * rstd) * w) * act(gate)),
 // one row per (token, head) of width dim; w is the plain weight (init 1).
+// act is sigmoid, or silu(gate) = g * sigmoid(g) when swish_gate (the
+// dense form's F.gated_rms_norm_zx act_fn="swish" knob).
 void gdn_gated_rmsnorm_bf16(const void* x, const void* gate, const void* weight,
                             void* y, int64_t rows, int dim, float eps,
-                            cudaStream_t stream);
+                            cudaStream_t stream, bool swish_gate = false);
 
 }  // namespace dgpp

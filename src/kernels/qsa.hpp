@@ -121,6 +121,12 @@ void qsa_select_from_keys(const uint64_t* keys_ws, int64_t ws_stride, const int6
                           int rows, int select_k, int kpool, int max_selected,
                           int32_t* topk_out, int32_t* out_counts, cudaStream_t stream);
 
+// The select-all form (no indexer): out_counts[r] = pos[r] < 0 ? 0 :
+// int32(pos[r]) + 1 — every token up to and including the row's position.
+// Pair with the attention launchers' contiguous=true, which reads token ids
+// as base + index instead of a materialized topk list.
+void qsa_select_all_counts(const int64_t* pos, int rows, int32_t* out_counts, cudaStream_t stream);
+
 // Listed GQA attention partials: one block per (row, split, head group of
 // hpb heads sharing a kv head); q bf16 rows of local_heads x dim (row
 // stride q_row_stride, heads contiguous); caches as qsa_kv_append writes
@@ -128,13 +134,15 @@ void qsa_select_from_keys(const uint64_t* keys_ws, int64_t ws_stride, const int6
 // / kv_heads). Probabilities round to bf16 for the V accumulation, l stays
 // unrounded (the DSA pin). m_ws / l_ws fp32 [rows, n_split, local_heads],
 // c_ws fp32 [rows, n_split, local_heads, dim]; merge with dsa_attn_combine
-// (kv_lora = dim). dim in {256, 512}.
+// (kv_lora = dim). dim in {256, 512}. contiguous = true (the select-all
+// form): token ids read as base + index; topk/topk_stride ignored.
 void qsa_attn_partial(const uint16_t* q, int64_t q_row_stride, const uint16_t* k_cache,
                       const uint16_t* v_cache, const int32_t* req_ids, const int32_t* topk,
                       int topk_stride, const int32_t* counts, int rows, int n_split,
                       int local_heads, int kv_heads, int dim, int block_tokens,
                       const int32_t* block_tables, int blocks_per_request, float scale,
-                      float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream);
+                      float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream,
+                      bool contiguous = false);
 // The same with the tile gather pinned: 1 = the cp.async phases (the
 // default; DGPP_QSA_ASYNC=0 turns the default to the serial gather),
 // 0 = serial, -1 = the default; heads_per_block (a divisor of the heads per
@@ -146,29 +154,33 @@ void qsa_attn_partial_gather(const uint16_t* q, int64_t q_row_stride, const uint
                       int local_heads, int kv_heads, int dim, int block_tokens,
                       const int32_t* block_tables, int blocks_per_request, float scale,
                       float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream,
-                      int async_gather, int heads_per_block, int heads_per_warp);
+                      int async_gather, int heads_per_block, int heads_per_warp,
+                      bool contiguous = false);
 
-// Prefill variant with wider KV sharing and cooperative warp softmax at dim=256;
 // other dimensions use qsa_attn_partial. Identical split/tile arithmetic and
 // workspace layout. The caller retains the decode kernel for small prefill grids.
+// contiguous = true (the select-all form) reads token ids as base + index;
+// topk/topk_stride are then ignored and may be null/0.
 void qsa_attn_prefill_partial(const uint16_t* q, int64_t q_row_stride, const uint16_t* k_cache,
                       const uint16_t* v_cache, const int32_t* req_ids, const int32_t* topk,
                       int topk_stride, const int32_t* counts, int rows, int n_split,
                       int local_heads, int kv_heads, int dim, int block_tokens,
                       const int32_t* block_tables, int blocks_per_request, float scale,
-                      float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream);
+                      float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream,
+                      bool contiguous = false);
 
 // One warp per (query, KV group) on the tensor cores (qsa_warp.cu): the
 // prefill attention over each row's listed tokens, written normalized as fp32
 // [rows, local_heads, 256] straight to `out` (no partials, no combine).
 // dim 256 and at most 16 query heads per KV head; tolerance-equal to
-// qsa_attn_prefill_partial + dsa_attn_combine.
+// qsa_attn_prefill_partial + dsa_attn_combine. contiguous = true: the
+// select-all form above.
 bool qsa_warp_supported(int dim, int local_heads, int kv_heads);
 void qsa_attn_prefill_warp(const uint16_t* q, int64_t q_row_stride, const uint16_t* k_cache,
                            const uint16_t* v_cache, const int32_t* req_ids, const int32_t* topk, int topk_stride,
                            const int32_t* counts, int rows, int local_heads, int kv_heads, int block_tokens,
                            const int32_t* block_tables, int blocks_per_request, float scale, float* out,
-                           cudaStream_t stream);
+                           cudaStream_t stream, bool contiguous = false);
 
 // out[r, h * dim + d] = bf16(bf16(c[r, h, d]) x bf16(sigmoid(gate))) with
 // the gate of head h at gate + r * gate_row_stride + h * gate_head_stride.

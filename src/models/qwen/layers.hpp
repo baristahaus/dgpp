@@ -66,14 +66,13 @@ void qwen_mtp_hidden_projection(const QwenGemmWorkspace& gemm, const uint16_t* a
     bool decode, cudaStream_t stream);
 
 // ---- the gated residual --------------------------------------------------------
-class QwenGrSite {
+// The walk's residual-stream sites (docs/qwen38_27b_dense_plan.md §3): the
+// gated-residual form (QwenGrSite) and the plain-residual form (QwenPlainSite)
+// behind one interface — mix(R -> x), combine(R += y) and its deferred form.
+// The walk composes sites without knowing which form a family runs.
+class QwenGrSite;
+class QwenResidualSite {
  public:
-  QwenGrSite(const QwenGrResident& w, const QwenGemmWorkspace& gemm, int hc, int hidden,
-             int lowrank, int max_tokens, float eps);
-  ~QwenGrSite();
-  QwenGrSite(const QwenGrSite&) = delete;
-  QwenGrSite& operator=(const QwenGrSite&) = delete;
-  void rebind(const QwenGrResident& w) { w_ = w; }
   // A combine left for the next site's mix to apply while its group norm
   // reads R (kernels/qwen_gr combine_norm, 2026-09-29): the branch output
   // y [T, H] and the site's gates [T, hc]. Null y: nothing pending.
@@ -82,19 +81,42 @@ class QwenGrSite {
     const float* gates = nullptr;
     int hc = 0;
   };
+  virtual ~QwenResidualSite() = default;
+  // x[T, H] from R[T, W]. `pending`: the previous site's combine applied
+  // first.
+  virtual void mix(uint16_t* r, uint16_t* x, int tokens, cudaStream_t stream,
+                   const PendingCombine* pending = nullptr) = 0;
+  // R += y, y [T, H].
+  virtual void combine(uint16_t* r, const uint16_t* y, int tokens, cudaStream_t stream) = 0;
+  // combine() deferred: the apply handed back for the next mix, or run
+  // here with nothing pending.
+  virtual PendingCombine defer_combine(uint16_t* r, const uint16_t* y, int tokens,
+                                       cudaStream_t stream) = 0;
+  // Applies a pending combine as its own launch (a reader of R that is not a mix).
+  static void apply_pending(uint16_t* r, const PendingCombine& p, int tokens, int hidden,
+                            cudaStream_t stream);
+};
+
+class QwenGrSite : public QwenResidualSite {
+ public:
+  using QwenResidualSite::PendingCombine;
+  QwenGrSite(const QwenGrResident& w, const QwenGemmWorkspace& gemm, int hc, int hidden,
+             int lowrank, int max_tokens, float eps);
+  ~QwenGrSite();
+  QwenGrSite(const QwenGrSite&) = delete;
+  QwenGrSite& operator=(const QwenGrSite&) = delete;
+  void rebind(const QwenGrResident& w) { w_ = w; }
   // x[T, H] from R[T, hc*H]; Rn stays in this object for combine().
   // `pending`: the previous site's combine applied first — inside the norm
   // launch on the batched decode rows, as its own launch otherwise.
   void mix(uint16_t* r, uint16_t* x, int tokens, cudaStream_t stream,
-           const PendingCombine* pending = nullptr);
+           const PendingCombine* pending = nullptr) override;
   // R += s(Rn) (x) y, y [T, H]; requires the site's inject weights.
-  void combine(uint16_t* r, const uint16_t* y, int tokens, cudaStream_t stream);
+  void combine(uint16_t* r, const uint16_t* y, int tokens, cudaStream_t stream) override;
   // combine() deferred: when this site's gates were computed by its mix
   // (the fused inject path) the apply is handed back for the next mix;
   // otherwise the combine runs here and nothing is pending.
-  PendingCombine defer_combine(uint16_t* r, const uint16_t* y, int tokens, cudaStream_t stream);
-  // Applies a pending combine as its own launch (a reader of R that is not a mix).
-  static void apply_pending(uint16_t* r, const PendingCombine& p, int tokens, int hidden, cudaStream_t stream);
+  PendingCombine defer_combine(uint16_t* r, const uint16_t* y, int tokens, cudaStream_t stream) override;
   const uint16_t* rn() const { return rn_; }
   // The bytes the constructor allocates for a shape (the memory plan).
   static size_t scratch_bytes(int hc, int hidden, int lowrank, int max_tokens);
@@ -132,6 +154,49 @@ class QwenGrSite {
   bool fused_mix_ = false;      // the decode rows' norm/act-staged GEMVs
   bool norm_fold_ = false;      // DGPP_QWEN_GR_NORM_FOLD=on: the batched rows' group norm staged into the down GEMV (measured +0.8 ms a pass, off)
   bool mix_fused_ = true;       // act_up with the mix in its epilogue (DGPP_QWEN_GR_MIX_FUSED=off: two launches)
+};
+
+// The plain-residual site (the dense 27B): x = qwen_rmsnorm(R) with the
+// layer's [hidden] weight, R += y as the reference's bf16 add (fp32 interior,
+// one rounding — glm_residual_add_bf16). No deferral: the add is a launch of
+// its own, nothing to fuse into the next norm (the reference materializes R
+// in bf16 between the two). No scratch.
+class QwenPlainSite : public QwenResidualSite {
+ public:
+  QwenPlainSite(int hidden, float eps) : hidden_(hidden), eps_(eps) {}
+  void rebind(const uint16_t* w) { w_ = w; }
+  void mix(uint16_t* r, uint16_t* x, int tokens, cudaStream_t stream,
+           const PendingCombine* pending = nullptr) override;
+  void combine(uint16_t* r, const uint16_t* y, int tokens, cudaStream_t stream) override;
+  PendingCombine defer_combine(uint16_t* r, const uint16_t* y, int tokens,
+                               cudaStream_t stream) override;
+
+ private:
+  const uint16_t* w_ = nullptr;
+  int hidden_;
+  float eps_;
+};
+
+// ---- Dense SwiGLU MLP (the 27B's plain form) -----------------------------------------
+class QwenDenseMlp {
+ public:
+  QwenDenseMlp(const QwenMlpResident& w, const QwenGemmWorkspace& gemm, int hidden,
+               int64_t local_inter, int max_tokens);
+  ~QwenDenseMlp();
+  QwenDenseMlp(const QwenDenseMlp&) = delete;
+  QwenDenseMlp& operator=(const QwenDenseMlp&) = delete;
+  void rebind(const QwenMlpResident& w) { w_ = w; }
+  // out[T, H] = down(swiglu(gate(x), up(x))), the reference's rounding:
+  // bf16(silu(gate)), bf16(that * up), one rounding on the down product.
+  void enqueue(const uint16_t* x, int tokens, uint16_t* out, cudaStream_t stream);
+  static size_t scratch_bytes(int64_t local_inter, int max_tokens);
+
+ private:
+  QwenMlpResident w_;
+  QwenGemmWorkspace g_;
+  int hidden_, max_tokens_;
+  int64_t inter_;
+  uint16_t* scratch_ = nullptr;  // [M, 3*I]: gate, up, act
 };
 
 // ---- Gated DeltaNet -----------------------------------------------------------------
@@ -179,6 +244,7 @@ class QwenGdnLayer {
   QwenGemmWorkspace g_;
   int hidden_, lk_, lv_, k_dim_, v_dim_, conv_width_, max_tokens_;
   float eps_, scale_;
+  bool gate_swish_ = false;  // output_gate_type "swish": silu instead of sigmoid
   int64_t conv_channels_ = 0;
   uint16_t* qkv_ = nullptr;     // [M, C]
   uint16_t* qkvc_ = nullptr;    // [M, C] post-conv
@@ -258,6 +324,7 @@ class QwenQsaLayer {
   int max_tokens_;
   int64_t max_pools_;
   float eps_, scale_;
+  bool has_idx_ = true;  // false: the dense form (select-all attention, no indexer)
   // The YaRN attention factor the cos/sin are built with (1.0f off the
   // knob): vLLM bakes mscale into its cos/sin cache, its softmax scale
   // staying head_dim^-0.5 (nvidia/qsa.py: self.scaling).

@@ -29,7 +29,8 @@ __global__ void attn_prefill_partial_kernel(const uint16_t* __restrict__ q, int6
                                     int local_heads, int kv_heads, int block_tokens,
                                     const int32_t* __restrict__ block_tables,
                                     int blocks_per_request, float scale, float* __restrict__ m_ws,
-                                    float* __restrict__ l_ws, float* __restrict__ c_ws) {
+                                    float* __restrict__ l_ws, float* __restrict__ c_ws,
+                                    bool contiguous) {
   constexpr int kGroups = 32;
   constexpr int kDslice = D / kGroups;  // 8 at D=256
   constexpr int kRowStride = D + 8;     // padded smem row (u16)
@@ -91,7 +92,7 @@ __global__ void attn_prefill_partial_kernel(const uint16_t* __restrict__ q, int6
       const int rem = idx - which * (n * kVecPerRow);
       const int tt = rem / kVecPerRow;
       const int c8 = rem - tt * kVecPerRow;
-      const int64_t tok = toks[t0 + tt];
+      const int64_t tok = contiguous ? t0 + tt : toks[t0 + tt];
       const int32_t blk = bt[tok / block_tokens];
       const int64_t phys = static_cast<int64_t>(blk) * block_tokens + tok % block_tokens;
       const uint16_t* src = (which == 0 ? k_cache : v_cache) + phys * width + kvh * D + c8 * 8;
@@ -148,16 +149,17 @@ void qsa_attn_prefill_partial(const uint16_t* q, int64_t q_row_stride, const uin
                       int topk_stride, const int32_t* counts, int rows, int n_split,
                       int local_heads, int kv_heads, int dim, int block_tokens,
                       const int32_t* block_tables, int blocks_per_request, float scale,
-                      float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream) {
+                      float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream,
+                      bool contiguous) {
   if (rows <= 0) return;
   if (dim != 256) {
     qsa_attn_partial(q, q_row_stride, k_cache, v_cache, req_ids, topk, topk_stride, counts,
                      rows, n_split, local_heads, kv_heads, dim, block_tokens, block_tables,
-                     blocks_per_request, scale, m_ws, l_ws, c_ws, stream);
+                     blocks_per_request, scale, m_ws, l_ws, c_ws, stream, contiguous);
     return;
   }
-  if (!q || !k_cache || !v_cache || !req_ids || !topk || !counts || !block_tables || !m_ws ||
-      !l_ws || !c_ws)
+  if (!q || !k_cache || !v_cache || !req_ids || (!topk && !contiguous) || !counts || !block_tables ||
+      !m_ws || !l_ws || !c_ws)
     throw std::invalid_argument("qsa_attn_prefill_partial: null pointer");
   if (local_heads <= 0 || kv_heads <= 0 || local_heads % kv_heads != 0)
     throw std::invalid_argument("qsa_attn_prefill_partial: local_heads must be a multiple of kv_heads");
@@ -177,7 +179,7 @@ void qsa_attn_prefill_partial(const uint16_t* q, int64_t q_row_stride, const uin
   attn_prefill_partial_kernel<256><<<grid, threads, smem, stream>>>(
       q, q_row_stride, k_cache, v_cache, req_ids, topk, topk_stride, counts, n_split,
       local_heads, kv_heads, block_tokens, block_tables, blocks_per_request, scale, m_ws,
-      l_ws, c_ws);
+      l_ws, c_ws, contiguous);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 

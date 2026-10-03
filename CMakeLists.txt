@@ -1981,6 +1981,15 @@ dgpp_set_common(qwen_vision_check)
 add_executable(qwen_vision_test tests/cuda/qwen_vision_test.cpp)
 target_link_libraries(qwen_vision_test PRIVATE dgpp_kernels CUDA::cudart)
 dgpp_set_common(qwen_vision_test)
+# The erf (exact) GELU's golden digest is arch-sensitive (FMA contraction in
+# the negative tail); the test picks its golden by the compile arch. GB10
+# builds (121a) keep the recorded sm_121a digests; sm_120a builds (the dense
+# 27B's deployment GPUs, docs/qwen38_27b_dense_plan.md §4) take their own.
+string(REGEX MATCH "^[0-9]+" DGPP_CUDA_ARCH "${CMAKE_CUDA_ARCHITECTURES}")
+if(NOT DGPP_CUDA_ARCH)
+  set(DGPP_CUDA_ARCH 121)
+endif()
+target_compile_definitions(qwen_vision_test PRIVATE DGPP_CUDA_ARCH=${DGPP_CUDA_ARCH})
 add_test(NAME qwen_vision_test COMMAND qwen_vision_test)
 set_tests_properties(qwen_vision_test PROPERTIES LABELS "gpu" SKIP_RETURN_CODE 2)
 

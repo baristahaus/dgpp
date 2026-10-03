@@ -52,6 +52,7 @@ bool is_replicated(const QwenExpectedTensor& e) {
     return true;
   switch (e.cls) {
     case QwenWeightClass::Embed:
+    case QwenWeightClass::Norm:
     case QwenWeightClass::Mixer:
     case QwenWeightClass::Gr:
     case QwenWeightClass::Router:
@@ -67,6 +68,7 @@ bool is_replicated(const QwenExpectedTensor& e) {
       return ends_with(e.name, "q_norm.weight") || ends_with(e.name, "k_norm.weight");
     case QwenWeightClass::LmHead:
     case QwenWeightClass::SharedExpert:
+    case QwenWeightClass::DenseMlp:
     case QwenWeightClass::RoutedExpert:
       return false;
   }
@@ -462,6 +464,9 @@ struct QwenLoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
     }
     a.q_norm = load_bf16(p + "q_norm.weight");
     a.k_norm = load_bf16(p + "k_norm.weight");
+    // The dense 27B's attention layers ship no indexer: the selection is
+    // every pool of the request (select-all, full history).
+    if (!cfg.has_indexer()) return;
     if (g_dense_weights_fp8 && !cfg.dense_fp8_shipped)
       a.index_qk_proj_fp8 = load_bf16_fp8(p + "indexer.index_qk_proj.weight");
     else
@@ -723,6 +728,26 @@ struct QwenLoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
     }
   }
 
+  // The dense form's SwiGLU MLP (the Qwen3.8-27B): gate/up by intermediate
+  // rows, down by intermediate columns — the shared expert's shapes at the
+  // full width. The at-load FP8 encode follows engine.dense_weights like
+  // every other dense matrix (the BF16 release never ships pre-encoded).
+  void build_dense_mlp(const std::string& p) {
+    QwenMlpResident& m = out.mlp;
+    const int64_t I = geo.local_inter;
+    const int64_t r = rank;
+    m.local_inter = I;
+    if (g_dense_weights_fp8 && !cfg.dense_fp8_shipped) {
+      m.fp8[0] = load_bf16_rows_fp8(p + "gate_proj.weight", r * I, I);
+      m.fp8[1] = load_bf16_rows_fp8(p + "up_proj.weight", r * I, I);
+      m.fp8[2] = load_bf16_cols_fp8(p + "down_proj.weight", r * I, I);
+    } else {
+      m.gate = load_bf16_rows(p + "gate_proj.weight", r * I, I);
+      m.up = load_bf16_rows(p + "up_proj.weight", r * I, I);
+      m.down = load_bf16_cols(p + "down_proj.weight", r * I, I);
+    }
+  }
+
   void build_layer(int layer) {
     const int max_layer = cfg.num_hidden_layers + (cfg.mtp_layer() >= 0 ? 1 : 0);
     if (layer < 0 || layer >= max_layer)
@@ -733,13 +758,24 @@ struct QwenLoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
     out.kind = is_mtp ? QwenLayerKind::Qsa : cfg.layers[layer];
     out.has_ple = !is_mtp && layer == cfg.ple_layer();
     if (out.has_ple) build_ple(p + "ple.");
-    build_gr(p + "attn_hyper_connection.", out.attn_gr, true);
+    if (cfg.has_gr()) {
+      build_gr(p + "attn_hyper_connection.", out.attn_gr, true);
+    } else {
+      // The plain-residual form: the per-site LayerNorm pair stands in for
+      // the gated-residual sites (the walk norms the residual, adds the
+      // site's output back).
+      out.ln_in = load_bf16(p + "input_layernorm.weight");
+      out.ln_post = load_bf16(p + "post_attention_layernorm.weight");
+    }
     if (out.kind == QwenLayerKind::Gdn)
       build_gdn(p + "linear_attn.");
     else
       build_qsa(p + "self_attn.");
-    build_gr(p + "mlp_hyper_connection.", out.mlp_gr, true);
-    build_moe(p + "mlp.");
+    if (cfg.has_gr()) build_gr(p + "mlp_hyper_connection.", out.mlp_gr, true);
+    if (cfg.has_moe())
+      build_moe(p + "mlp.");
+    else
+      build_dense_mlp(p + "mlp.");
     run_gptq_jobs();
   }
 };
@@ -770,8 +806,8 @@ QwenLocalGeometry QwenLocalGeometry::from_config(const QwenTextConfig& cfg, int 
   if (g.head_begin / q_per_kv != g.kv_head_begin ||
       (g.head_begin + g.local_heads - 1) / q_per_kv != g.kv_head_begin + g.local_kv_heads - 1)
     throw std::invalid_argument("qwen loader: the query heads of a rank straddle kv heads");
-  g.local_inter = cfg.moe_intermediate_size / world;
-  g.local_shared_inter = cfg.shared_expert_intermediate_size / world;
+  g.local_inter = (cfg.has_moe() ? cfg.moe_intermediate_size : cfg.intermediate_size) / world;
+  g.local_shared_inter = cfg.has_moe() ? cfg.shared_expert_intermediate_size / world : 0;
   g.scale_block = gcd_int(128, static_cast<int>(g.local_inter));
   if (!cfg.ple_layer_ids.empty()) {
     const QwenNgramGeometry ng = cfg.ngram_geometry();
@@ -1057,13 +1093,47 @@ void QwenLoaderFamily::build_globals(const QwenTextConfig& cfg_, const QwenLocal
     globals_.lm_vocab_begin = begin;
     globals_.lm_vocab_count = count;
   }
-  copy_gr("model.language_model.hyper_connection_mixer.", globals_.mixer);
+  // The final read: the GR form folds it into the model-level mixer; the
+  // plain-residual form carries the model's final RMSNorm itself.
+  if (cfg_.has_gr())
+    copy_gr("model.language_model.hyper_connection_mixer.", globals_.mixer);
+  else
+    globals_.final_norm = copy_global("model.language_model.norm.weight");
   if (cfg_.mtp_layer() >= 0) {
-    globals_.mtp_fc_embedding = copy_global("mtp.fc_embedding.weight");
-    globals_.mtp_fc_hidden = copy_global("mtp.fc_hidden.weight");
     globals_.mtp_pre_fc_norm_embedding = copy_global("mtp.pre_fc_norm_embedding.weight");
     globals_.mtp_pre_fc_norm_hidden = copy_global("mtp.pre_fc_norm_hidden.weight");
-    copy_gr("mtp.hyper_connection_mixer.", globals_.mtp_mixer);
+    if (cfg_.has_gr()) {
+      globals_.mtp_fc_embedding = copy_global("mtp.fc_embedding.weight");
+      globals_.mtp_fc_hidden = copy_global("mtp.fc_hidden.weight");
+      copy_gr("mtp.hyper_connection_mixer.", globals_.mtp_mixer);
+    } else {
+      // The dense release's fused draft fc [H, 2H], embedding half first
+      // (§1/§2): split at load into the same two [H, H] halves Flash-Next
+      // binds, so the draft fc path downstream is unchanged code. The
+      // two-GEMV + bf16 add is three roundings against the reference's one
+      // fused fp32 accumulation — a draft-side-only deviation, accepted by
+      // the plan (§0: "split fused fc"); the served output stays the
+      // trunk's.
+      const TensorInfo& t = lookup("mtp.fc.weight");
+      const int64_t H = cfg_.hidden_size;
+      if (t.shape != std::vector<int64_t>{H, 2 * H} || t.dtype != DType::BF16)
+        throw std::runtime_error("qwen loader: 'mtp.fc.weight' is not the fused [H, 2H] BF16 matrix");
+      uint16_t* emb = static_cast<uint16_t*>(globals_bump_->alloc(static_cast<size_t>(H) * H * 2));
+      uint16_t* hid = static_cast<uint16_t*>(globals_bump_->alloc(static_cast<size_t>(H) * H * 2));
+      {
+        const uint16_t* src = static_cast<const uint16_t*>(t.data);
+        uint16_t* de = globals_bump_->host(emb);
+        uint16_t* dh = globals_bump_->host(hid);
+        for (int64_t row = 0; row < H; ++row) {
+          std::memcpy(de + row * H, src + row * 2 * H, static_cast<size_t>(H) * 2);
+          std::memcpy(dh + row * H, src + row * 2 * H + H, static_cast<size_t>(H) * 2);
+        }
+      }
+      source_bytes_ += t.nbytes();
+      globals_.mtp_fc_embedding = emb;
+      globals_.mtp_fc_hidden = hid;
+      globals_.mtp_norm = copy_global("mtp.norm.weight");
+    }
   }
 }
 

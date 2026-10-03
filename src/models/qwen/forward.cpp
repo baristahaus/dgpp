@@ -70,7 +70,7 @@ QwenModel::QwenModel(const QwenTextConfig& cfg, const std::string& checkpoint_di
   if (cfg_.eos_token_ids.empty()) throw std::invalid_argument("QwenModel: the config names no EOS token");
   init_stream();
   loader_.set_reader_stream(stream_);
-  const int H = cfg_.hidden_size, W = cfg_.hc_count * H;
+  const int H = cfg_.hidden_size, W = cfg_.hyper_width();
   globals_ = loader_.load_globals();
   // The generic session core (engine/session_model.hpp) over this family's
   // geometry: the pool's 64-token blocks, snapshots at pool boundaries,
@@ -124,10 +124,12 @@ QwenModel::QwenModel(const QwenTextConfig& cfg, const std::string& checkpoint_di
   if (has_ple_) table_ = loader_.load_ngram_table();
   for (int l = 0; l < cfg_.num_hidden_layers; ++l)
     (cfg_.layers[static_cast<size_t>(l)] == QwenLayerKind::Gdn ? num_gdn_ : num_qsa_) += 1;
-  n_moe_layers_ = cfg_.num_hidden_layers;  // every layer carries the MoE
-  // The routed chain on this rank's slice of the intermediate dim.
-  moe_cfg_ = QwenMoeLayer::routed_config(H, static_cast<int>(loader_.geometry().local_inter),
-                                         cfg_.num_experts, cfg_.num_experts_per_tok, cfg_.norm_topk_prob);
+  // The routed chain on this rank's slice of the intermediate dim — only
+  // the MoE form has one (the dense 27B runs QwenDenseMlp instead).
+  n_moe_layers_ = cfg_.has_moe() ? cfg_.num_hidden_layers : 0;
+  if (cfg_.has_moe())
+    moe_cfg_ = QwenMoeLayer::routed_config(H, static_cast<int>(loader_.geometry().local_inter),
+                                           cfg_.num_experts, cfg_.num_experts_per_tok, cfg_.norm_topk_prob);
 
   // Per-slot state from the local geometry (the layer objects agree — they
   // are built from the same numbers).
@@ -206,12 +208,22 @@ QwenModel::QwenModel(const QwenTextConfig& cfg, const std::string& checkpoint_di
     // overrides through the prefetcher's own default.
     prefetch_window_bytes_ = std::getenv("DGPP_L2_PREFETCH_MB") ? 0 : (size_t{20} << 20);
   }
-  // The mixer (the final read) is a global.
-  mixer_ = std::make_unique<QwenGrSite>(globals_.mixer, gw_, cfg_.hc_count, H, cfg_.hc_lowrank, max_tokens_, cfg_.rms_norm_eps);
+  // The mixer (the final read) is a global: the GR form's site, or the
+  // plain form's final norm standing in for it.
+  if (cfg_.has_gr()) {
+    mixer_ = std::make_unique<QwenGrSite>(globals_.mixer, gw_, cfg_.hc_count, H, cfg_.hc_lowrank, max_tokens_, cfg_.rms_norm_eps);
+    mixer_site_ = mixer_.get();
+  } else {
+    mixer_plain_ = std::make_unique<QwenPlainSite>(H, cfg_.rms_norm_eps);
+    mixer_plain_->rebind(globals_.final_norm);
+    mixer_site_ = mixer_plain_.get();
+  }
   for (int req = 0; req < max_requests_; ++req) push_context(req, eos_, eos_);
   if (mtp_) {
-    if (!globals_.mtp_fc_embedding || !globals_.mtp_fc_hidden || !globals_.mtp_pre_fc_norm_embedding ||
-        !globals_.mtp_pre_fc_norm_hidden || !globals_.mtp_mixer.hc_norm)
+    const bool fc_bound = globals_.mtp_fc_embedding != nullptr &&
+                        globals_.mtp_fc_hidden != nullptr;
+    if (!fc_bound || !globals_.mtp_pre_fc_norm_embedding || !globals_.mtp_pre_fc_norm_hidden ||
+        (cfg_.has_gr() ? !globals_.mtp_mixer.hc_norm : !globals_.mtp_norm))
       throw std::runtime_error("QwenModel: the draft head's globals are unbound");
     mtp_ring_snapshot_ = dev_alloc<uint16_t>(R * ring_elems());
     mtp_chain_ring_ = dev_alloc<uint16_t>(R * ring_elems());
@@ -222,8 +234,15 @@ QwenModel::QwenModel(const QwenTextConfig& cfg, const std::string& checkpoint_di
     mtp_e_ = dev_alloc<uint16_t>(M * H);
     mtp_en_ = dev_alloc<uint16_t>(M * H);
     mtp_ein_ = dev_alloc<uint16_t>(M * H);
-    mtp_mixer_ = std::make_unique<QwenGrSite>(globals_.mtp_mixer, gw_, cfg_.hc_count, H, cfg_.hc_lowrank,
-                                              max_tokens_, cfg_.rms_norm_eps);
+    if (cfg_.has_gr()) {
+      mtp_mixer_ = std::make_unique<QwenGrSite>(globals_.mtp_mixer, gw_, cfg_.hc_count, H, cfg_.hc_lowrank,
+                                                max_tokens_, cfg_.rms_norm_eps);
+      mtp_mixer_site_ = mtp_mixer_.get();
+    } else {
+      mtp_mixer_plain_ = std::make_unique<QwenPlainSite>(H, cfg_.rms_norm_eps);
+      mtp_mixer_plain_->rebind(globals_.mtp_norm);
+      mtp_mixer_site_ = mtp_mixer_plain_.get();
+    }
   }
   DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
   // The tower is replicated (it runs only on image prefills, never inside a
@@ -268,7 +287,7 @@ QwenModel::MemoryPlan QwenModel::plan_memory(const QwenTextConfig& cfg, int max_
   const size_t R = static_cast<size_t>(max_requests);
   // The fixed batch's row ceiling, floored as the session core floors it.
   const size_t rows = static_cast<size_t>(std::max({kDecodeRows, decode_rows, max_requests}));
-  const size_t H = static_cast<size_t>(cfg.hidden_size), W = static_cast<size_t>(cfg.hc_count) * H;
+  const size_t H = static_cast<size_t>(cfg.hidden_size), W = static_cast<size_t>(cfg.hyper_width());
   const size_t V = static_cast<size_t>(QwenLayerStream::lm_vocab_count(cfg, tp_rank, tp_world, head));
   int num_gdn = 0, num_qsa = 0;
   for (QwenLayerKind k : cfg.layers) (k == QwenLayerKind::Gdn ? num_gdn : num_qsa) += 1;
@@ -354,21 +373,28 @@ QwenModel::MemoryPlan QwenModel::plan_memory(const QwenTextConfig& cfg, int max_
   const int64_t max_pools =
       (plan.context_tokens + cfg.indexer_compress_ratio - 1) / cfg.indexer_compress_ratio;
   size_t layers = 0;
-  layers += 3 * QwenGrSite::scratch_bytes(cfg.hc_count, cfg.hidden_size, cfg.hc_lowrank, max_tokens);
+  if (cfg.has_gr())
+    layers += 3 * QwenGrSite::scratch_bytes(cfg.hc_count, cfg.hidden_size, cfg.hc_lowrank, max_tokens);
   if (num_gdn > 0) layers += QwenGdnLayer::scratch_bytes(cfg, geo.local_key_heads, geo.local_value_heads, max_tokens);
   if (pool_layers > 0) layers += QwenQsaLayer::scratch_bytes(cfg, geo.local_heads, geo.local_kv_heads, max_tokens, max_pools);
   if (has_ple) layers += QwenPleLayer::scratch_bytes(cfg, geo.hash_heads, max_tokens);
-  plan.add("layer objects (GR sites, GDN, QSA, PLE)", layers);
-  const GlmMoeConfig moe_cfg = QwenMoeLayer::routed_config(cfg.hidden_size, static_cast<int>(geo.local_inter),
-                                                           cfg.num_experts, cfg.num_experts_per_tok, cfg.norm_topk_prob);
-  size_t moe_pinned = 0;
-  const int table_slots = residency == QwenResidency::Resident ? cfg.num_hidden_layers + (mtp ? 1 : 0) : 0;
-  const size_t moe_dev = QwenMoeLayer::scratch_bytes(moe_cfg, geo.local_shared_inter, max_tokens, &moe_pinned,
-                                                     static_cast<int>(rows), table_slots);
-  plan.add("moe scratch (routed slots, shared expert, graph tables)", moe_dev, moe_pinned);
-  if (cfg.experts_nvfp4)
-    plan.add("moe W4A4 activation workspace",
-             GlmMoeLayer::w4a4_scratch_bytes(moe_cfg, max_tokens, true));
+  plan.add("layer objects (residual sites, GDN, QSA, PLE)", layers);
+  if (cfg.has_moe()) {
+    const GlmMoeConfig moe_cfg = QwenMoeLayer::routed_config(cfg.hidden_size, static_cast<int>(geo.local_inter),
+                                                             cfg.num_experts, cfg.num_experts_per_tok, cfg.norm_topk_prob);
+    size_t moe_pinned = 0;
+    const int table_slots = residency == QwenResidency::Resident ? cfg.num_hidden_layers + (mtp ? 1 : 0) : 0;
+    const size_t moe_dev = QwenMoeLayer::scratch_bytes(moe_cfg, geo.local_shared_inter, max_tokens, &moe_pinned,
+                                                       static_cast<int>(rows), table_slots);
+    plan.add("moe scratch (routed slots, shared expert, graph tables)", moe_dev, moe_pinned);
+    if (cfg.experts_nvfp4)
+      plan.add("moe W4A4 activation workspace",
+               GlmMoeLayer::w4a4_scratch_bytes(moe_cfg, max_tokens, true));
+  } else {
+    // The dense form's SwiGLU MLP scratch, every layer shares one object.
+    plan.add("dense mlp scratch (gate, up, act)",
+             QwenDenseMlp::scratch_bytes(geo.local_inter, max_tokens));
+  }
   if (cfg.lm_head_gptq_int8)
     plan.add("head argmax bounds and candidate list (four rows x vocab fp32, vocab int32)",
              4 * static_cast<size_t>(geo.lm_vocab_count) * 4 + static_cast<size_t>(geo.lm_vocab_count) * 4 + 64);
@@ -378,9 +404,13 @@ QwenModel::MemoryPlan QwenModel::plan_memory(const QwenTextConfig& cfg, int max_
              n * static_cast<size_t>(cfg.hidden_size) + n * static_cast<size_t>(cfg.hidden_size / cfg.gptq_group) * 2 + n * 4);
   }
   if (mtp) {
-    plan.add("draft block (hyper-state window, ring snapshot, fusion scratch, mixer)",
+    // The draft's GR mixer scratch exists only in the GR form; the dense
+    // draft runs the plain sites.
+    const size_t mixer_scratch =
+        cfg.has_gr() ? QwenGrSite::scratch_bytes(cfg.hc_count, cfg.hidden_size, cfg.hc_lowrank, max_tokens) : 0;
+    plan.add("draft block (hidden window, ring snapshot, fusion scratch, mixer)",
              R * rows * W * 2 + R * ring_elems * 2 + 4 * M * W * 2 + 3 * M * H * 2 + R * 24 +
-                 QwenGrSite::scratch_bytes(cfg.hc_count, cfg.hidden_size, cfg.hc_lowrank, max_tokens),
+                 mixer_scratch,
              R * 8);
   }
   if (cfg.vision) {
@@ -696,12 +726,26 @@ void QwenModel::push_context(int req, int32_t prev1, int32_t prev2) {
 
 void QwenModel::build_layer_objects(const QwenLayerResident& r) {
   const int H = cfg_.hidden_size;
-  if (!attn_gr_) {
-    attn_gr_ = std::make_unique<QwenGrSite>(r.attn_gr, gw_, cfg_.hc_count, H, cfg_.hc_lowrank, max_tokens_, cfg_.rms_norm_eps);
-    mlp_gr_ = std::make_unique<QwenGrSite>(r.mlp_gr, gw_, cfg_.hc_count, H, cfg_.hc_lowrank, max_tokens_, cfg_.rms_norm_eps);
+  if (cfg_.has_gr()) {
+    if (!attn_gr_) {
+      attn_gr_ = std::make_unique<QwenGrSite>(r.attn_gr, gw_, cfg_.hc_count, H, cfg_.hc_lowrank, max_tokens_, cfg_.rms_norm_eps);
+      mlp_gr_ = std::make_unique<QwenGrSite>(r.mlp_gr, gw_, cfg_.hc_count, H, cfg_.hc_lowrank, max_tokens_, cfg_.rms_norm_eps);
+      attn_site_ = attn_gr_.get();
+      mlp_site_ = mlp_gr_.get();
+    } else {
+      attn_gr_->rebind(r.attn_gr);
+      mlp_gr_->rebind(r.mlp_gr);
+    }
   } else {
-    attn_gr_->rebind(r.attn_gr);
-    mlp_gr_->rebind(r.mlp_gr);
+    // The plain form: the two sites hold the per-layer [hidden] norms.
+    if (!attn_plain_) {
+      attn_plain_ = std::make_unique<QwenPlainSite>(H, cfg_.rms_norm_eps);
+      mlp_plain_ = std::make_unique<QwenPlainSite>(H, cfg_.rms_norm_eps);
+      attn_site_ = attn_plain_.get();
+      mlp_site_ = mlp_plain_.get();
+    }
+    attn_plain_->rebind(r.ln_in);
+    mlp_plain_->rebind(r.ln_post);
   }
   if (r.kind == QwenLayerKind::Gdn) {
     if (!gdn_) {
@@ -720,16 +764,24 @@ void QwenModel::build_layer_objects(const QwenLayerResident& r) {
       qsa_->rebind(r.qsa);
     }
   }
-  if (!moe_) {
-    // The decode fast path's provisioning: the decode-row ceiling's slot rows and one
-    // graph table slot per MoE layer (resident stacks bake them in).
-    const int table_slots =
-        loader_.residency() == QwenResidency::Resident ? n_moe_layers_ + (mtp_ ? 1 : 0) : 0;
-    moe_ = std::make_unique<QwenMoeLayer>(moe_view(r.moe), moe_cfg_, gemm_, max_tokens_, max_decode_rows_,
-                                          table_slots);
-    moe_->set_mma_from_rows(gw_.mma_from_rows);
+  if (cfg_.has_moe()) {
+    if (!moe_) {
+      // The decode fast path's provisioning: the decode-row ceiling's slot rows and one
+      // graph table slot per MoE layer (resident stacks bake them in).
+      const int table_slots =
+          loader_.residency() == QwenResidency::Resident ? n_moe_layers_ + (mtp_ ? 1 : 0) : 0;
+      moe_ = std::make_unique<QwenMoeLayer>(moe_view(r.moe), moe_cfg_, gemm_, max_tokens_, max_decode_rows_,
+                                            table_slots);
+      moe_->set_mma_from_rows(gw_.mma_from_rows);
+    } else {
+      moe_->rebind(moe_view(r.moe));
+    }
   } else {
-    moe_->rebind(moe_view(r.moe));
+    // The dense form's SwiGLU MLP (docs/qwen38_27b_dense_plan.md §2).
+    if (!mlp_)
+      mlp_ = std::make_unique<QwenDenseMlp>(r.mlp, gw_, H, r.mlp.local_inter, max_tokens_);
+    else
+      mlp_->rebind(r.mlp);
   }
   if (r.has_ple) {
     if (!ple_) {
@@ -844,6 +896,19 @@ void QwenModel::prefetch_ffn_side(const QwenLayerResident& r) {
   if (!prefetch_.enabled()) return;
   const size_t H = static_cast<size_t>(cfg_.hidden_size);
   prefetch_.open_window(stream_, prefetch_window_bytes_, prefetch_.boundary_rate());
+  if (!cfg_.has_gr()) {
+    // The dense form: the site's [hidden] norm, then the SwiGLU trio — the
+    // gate/up pair first (the swiglu kernel reads both), the down behind.
+    prefetch_add("r.ln_post", r.ln_post, H * 2);
+    const size_t I = static_cast<size_t>(r.mlp.local_inter);
+    if (r.mlp.gate) prefetch_bf16("r.mlp.gate", r.mlp.gate, I * H * 2);
+    else prefetch_fp8("r.mlp.fp8[0]", r.mlp.fp8[0]);
+    if (r.mlp.up) prefetch_bf16("r.mlp.up", r.mlp.up, I * H * 2);
+    else prefetch_fp8("r.mlp.fp8[1]", r.mlp.fp8[1]);
+    if (r.mlp.down) prefetch_bf16("r.mlp.down", r.mlp.down, H * I * 2);
+    else prefetch_fp8("r.mlp.fp8[2]", r.mlp.fp8[2]);
+    return;
+  }
   prefetch_gr(r.mlp_gr, /*inject=*/true);
   if (r.moe.router) prefetch_add("r.moe.router", r.moe.router, static_cast<size_t>(cfg_.num_experts) * H * 2);
   if (r.moe.shared_gate) prefetch_add("r.moe.shared_gate", r.moe.shared_gate, H * 2);
@@ -859,7 +924,7 @@ void QwenModel::prefetch_ffn_side(const QwenLayerResident& r) {
 void QwenModel::prefetch_attention_side(int layer) {
   if (!prefetch_.enabled()) return;
   if (layer >= cfg_.num_hidden_layers) {
-    prefetch_head(globals_.mixer);
+    prefetch_head(globals_.mixer, globals_.final_norm);
     return;
   }
   // Resident stacks only: load_layer is a lookup there; a streaming stack
@@ -868,7 +933,8 @@ void QwenModel::prefetch_attention_side(int layer) {
   const QwenLayerResident& r = loader_.load_layer(layer);
   const size_t H = static_cast<size_t>(cfg_.hidden_size);
   prefetch_.open_window(stream_, prefetch_window_bytes_, prefetch_.boundary_rate());
-  prefetch_gr(r.attn_gr, /*inject=*/true);
+  if (!cfg_.has_gr()) prefetch_add("r.ln_in", r.ln_in, H * 2);
+  else prefetch_gr(r.attn_gr, /*inject=*/true);
   if (r.kind == QwenLayerKind::Gdn && r.gdn.in_proj_qkv) {
     const size_t rows = static_cast<size_t>(r.gdn.local_key_heads) * cfg_.gdn_key_head_dim * 2 +
                         static_cast<size_t>(r.gdn.local_value_heads) * cfg_.gdn_value_head_dim;
@@ -889,11 +955,14 @@ void QwenModel::prefetch_attention_side(int layer) {
 // that — the fixture's do; a bridged hole is an out-of-bounds read
 // (compute-sanitizer, 2026-09-09). So the current layer's 82 KB inject
 // is never added beside the next image's weights.
-void QwenModel::prefetch_head(const QwenGrResident& mixer) {
+void QwenModel::prefetch_head(const QwenGrResident& mixer, const uint16_t* plain_norm) {
   if (!prefetch_.enabled()) return;
   const size_t H = static_cast<size_t>(cfg_.hidden_size);
   prefetch_.open_window(stream_, prefetch_window_bytes_, prefetch_.boundary_rate());
-  prefetch_gr(mixer, /*inject=*/false);
+  if (plain_norm != nullptr)  // the dense form: the final norm stands in for the mixer
+    prefetch_add("final_norm", plain_norm, H * 2);
+  else
+    prefetch_gr(mixer, /*inject=*/false);
   // Far larger than the window: add() clamps, the GEMV's leading rows hit.
   if (&mixer == &globals_.mtp_mixer && globals_.draft_head_packed.packed) {
     prefetch_add("globals_.draft_head_packed", globals_.draft_head_packed.packed, globals_.draft_head_packed.packed_bytes());
@@ -934,7 +1003,7 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
   qwen_configure_gemm_rows(gemm_, T, run.decode);
   if (run.capture && loader_.residency() != QwenResidency::Resident)
     throw std::logic_error("run_rows: a capture needs a resident stack");
-  const int H = cfg_.hidden_size, W = cfg_.hc_count * H;
+  const int H = cfg_.hidden_size, W = cfg_.hyper_width();
   const RowInputs in = begin_run(run);
   const bool batched = in.batched;
   const int num_requests = in.num_requests;
@@ -960,7 +1029,8 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
     ple_->stage(tokens, T, d_req, d_pos, d_spans, num_requests, d_ctx_, stream_,
                 scalar_prefill ? run.ids : nullptr, scalar_prefill ? run.pos0 : -1, scalar_prefill ? run.req : -1);
   }
-  glm_embed_bcast_streams(globals_.embed, tokens, r_, T, H, stream_);
+  glm_embed_bcast_streams(globals_.embed, tokens, r_, T, H,
+                          cfg_.hc_count > 0 ? cfg_.hc_count : 1, stream_);
   // Image rows replace the embedding at their prompt positions; the tower
   // already projected them (see apply_image_embeddings). Only its own
   // slot's prefill walk carries a request's images; any other walk with a
@@ -968,7 +1038,7 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
   if (const auto* images = images_for_req(run.req)) {
     if (run.decode || run.batch_requests || run.num_spans)
       throw std::logic_error("Qwen: image prefill reached a non-prefill walk");
-    apply_image_embeddings(r_, run.pos0, T, 0, cfg_.hc_count, images);
+    apply_image_embeddings(r_, run.pos0, T, 0, cfg_.hc_count > 0 ? cfg_.hc_count : 1, images);
   }
 
   // The state families' per-row snapshots (the rollback's source).
@@ -1037,7 +1107,7 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
       ple_->finish(r_, value, ple_conv_state_, ple_conv_elems_, d_req, d_pos, d_spans, num_requests, T,
                    stream_, snapshots ? spec_ple_ : nullptr);
     }
-    attn_gr_->mix(r_, x_, T, stream_, &pend);
+    attn_site_->mix(r_, x_, T, stream_, &pend);
     pend = {};
     uint16_t* attn_out = stage(y_, H);
     if (r.kind == QwenLayerKind::Gdn) {
@@ -1110,11 +1180,13 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
     }
     if (run.decode) prefetch_ffn_side(r);
     fold(attn_out, H);  // block boundary 1: the attention output projection's partial
-    pend = attn_gr_->defer_combine(r_, attn_out, T, stream_);
-    mlp_gr_->mix(r_, x_, T, stream_, &pend);
+    pend = attn_site_->defer_combine(r_, attn_out, T, stream_);
+    mlp_site_->mix(r_, x_, T, stream_, &pend);
     pend = {};
     uint16_t* ffn_out = stage(y_, H);
-    if (run.decode) {
+    if (!cfg_.has_moe()) {
+      mlp_->enqueue(x_, T, ffn_out, stream_);
+    } else if (run.decode) {
       moe_->enqueue_decode(x_, ffn_out, T, stream_, run.capture ? layer : -1);
     } else if (moe_prefill_host_path_) {
       moe_->enqueue(x_, ffn_out, T, stream_);  // the host-orchestrated reference chain
@@ -1140,7 +1212,7 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
     }
     if (run.decode) prefetch_attention_side(layer + 1);
     fold(ffn_out, H);  // block boundary 2: the experts' sliced down projections
-    pend = mlp_gr_->defer_combine(r_, ffn_out, T, stream_);
+    pend = mlp_site_->defer_combine(r_, ffn_out, T, stream_);
     if (run.capture_layers) {
       QwenGrSite::apply_pending(r_, pend, T, H, stream_);
       pend = {};
@@ -1158,7 +1230,7 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
   // chunks, BF16 heads (cuBLAS is m-dependent), decode, all-row runs and
   // group prefills keep the full head. DGPP_PREFILL_HEAD_ALL_ROWS=1 keeps
   // it everywhere.
-  mixer_->mix(r_, h_, T, stream_, &pend);  // the last layer's combine rides the mixer's norm
+  mixer_site_->mix(r_, h_, T, stream_, &pend);  // the last layer's combine rides the mixer's norm
   pend = {};
   static const bool head_all_rows = [] {
     const char* e = std::getenv("DGPP_PREFILL_HEAD_ALL_ROWS");
@@ -1399,14 +1471,14 @@ void QwenModel::graph_prepare() {
   for (int layer = 0; layer < cfg_.num_hidden_layers; ++layer) {
     const QwenLayerResident& r = loader_.load_layer(layer);
     build_layer_objects(r);
-    moe_->prepare_graph_table(layer, stream_);
+    if (moe_) moe_->prepare_graph_table(layer, stream_);
     if (pack) pack_layer_companions(layer, r);
   }
   if (mtp_) {
     // The draft layer's MoE takes the slot after the main stack's.
     const QwenLayerResident& r = loader_.load_layer(cfg_.mtp_layer());
     build_layer_objects(r);
-    moe_->prepare_graph_table(n_moe_layers_, stream_);
+    if (moe_) moe_->prepare_graph_table(n_moe_layers_, stream_);
     if (pack) pack_layer_companions(cfg_.mtp_layer(), r);
   }
   if (pack) finish_companions();
@@ -1438,6 +1510,9 @@ static bool gr_down_bf12() {
   return on;
 }
 
+// The mixers' down matrices exist only in the GR form.
+static bool mixer_down_bf12(const QwenTextConfig& cfg) { return cfg.has_gr() && gr_down_bf12(); }
+
 void QwenModel::pack_layer_companions(int layer, const QwenLayerResident& r) {
   // Under fp8 dense weights only the draft layer can still carry bf16
   // projections (the hybrid ships the backbone's as block-FP8 and leaves
@@ -1453,7 +1528,7 @@ void QwenModel::pack_layer_companions(int layer, const QwenLayerResident& r) {
   // the site streams them from DRAM there (at worlds 2 and 4 the boundary
   // window lands them in L2 and the packed decode only adds ops — the
   // 2026-09-26 bench); the up matrix's 320-element rows stay bf16.
-  if (tp_world() == 1 && gr_down_bf12()) {
+  if (tp_world() == 1 && cfg_.has_gr() && gr_down_bf12()) {
     const int64_t W = static_cast<int64_t>(cfg_.hyper_width());
     if (!r.attn_gr.down_fp8.payload) pack(r.attn_gr.down, cfg_.hc_lowrank, W);
     if (!r.mlp_gr.down_fp8.payload) pack(r.mlp_gr.down, cfg_.hc_lowrank, W);
@@ -1493,7 +1568,7 @@ void QwenModel::finish_companions() {
   const auto t0 = std::chrono::steady_clock::now();
   const int64_t H = cfg_.hidden_size;
   const auto release = [&](const void* w) { return loader_.release_packed(-1, w); };
-  if (tp_world() == 1 && gr_down_bf12()) {  // the mixers' down matrices (world 1, as the layers')
+  if (tp_world() == 1 && mixer_down_bf12(cfg_)) {  // the mixers' down matrices (world 1, as the layers')
     const int64_t W = static_cast<int64_t>(cfg_.hyper_width());
     if (!globals_.mixer.down_fp8.payload && globals_.mixer.down)
       bf12_.pack_and_release(globals_.mixer.down, cfg_.hc_lowrank, W, gemm_, stream_, release);
@@ -1515,7 +1590,7 @@ void QwenModel::finish_companions() {
 size_t QwenModel::bf12_plan_bytes(const QwenTextConfig& cfg, const QwenLocalGeometry& geo, bool mtp) {
   const int64_t H = cfg.hidden_size;
   // The hyper-connection downs at world 1 (two per layer, the mixers).
-  const size_t gr_down = geo.world == 1 && gr_down_bf12()
+  const size_t gr_down = geo.world == 1 && cfg.has_gr() && gr_down_bf12()
                              ? (2 * cfg.layers.size() + (mtp ? 2 : 1)) *
                                    Bf12Companions::planned_bytes(cfg.hc_lowrank, static_cast<int64_t>(cfg.hyper_width()))
                              : 0;
@@ -1551,7 +1626,7 @@ void QwenModel::mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos, 
   if (!mtp_) throw std::logic_error("mtp_run_rows: MTP is not enabled");
   if (T <= 0 || T > max_tokens_) throw std::invalid_argument("mtp_run_rows: rows");
   if (head_rows < 0 || head_rows > T) throw std::invalid_argument("mtp_run_rows: head_rows");
-  const int H = cfg_.hidden_size, W = cfg_.hc_count * H, hc = cfg_.hc_count;
+  const int H = cfg_.hidden_size, W = cfg_.hyper_width(), hc = cfg_.hc_count;
   const float eps = cfg_.rms_norm_eps;
   const bool batched = batch_requests > 0;
   const int num_requests = batched ? batch_requests : 1;
@@ -1569,7 +1644,13 @@ void QwenModel::mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos, 
     hin = mtp_hin_;
   }
   qwen_rmsnorm_bf16(hin, globals_.mtp_pre_fc_norm_hidden, mtp_hn_, T, W, eps, stream_);
-  qwen_mtp_hidden_projection(gw_, mtp_hn_, globals_.mtp_fc_hidden, mtp_enc_, T, hc, H, decode_row, stream_);
+  // The dense form runs the same two-projection + fuse chain with one
+  // branch: the halves of its fused fc bound at load (§2), the fuse's
+  // hc=1 pass the plain bf16 add. Three roundings stand against the
+  // reference's one fused accumulation — draft-side only, per the plan.
+  const int hc_fc = cfg_.has_gr() ? hc : 1;
+  qwen_mtp_hidden_projection(gw_, mtp_hn_, globals_.mtp_fc_hidden, mtp_enc_, T, hc_fc, H,
+                             decode_row, stream_);
   qwen_mtp_embed_gather_bf16(globals_.embed, tokens, mtp_e_, T, H, stream_);
   // The draft's row at position p embeds token p + 1, so its image window is
   // the main walk's shifted by one (and one row past a chunk's end, which is
@@ -1583,7 +1664,7 @@ void QwenModel::mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos, 
   // guard keeping 17-32 decode rows kernel-only too.
   qwen_mtp_hidden_projection(gw_, mtp_en_, globals_.mtp_fc_embedding, mtp_ein_, T, 1, H,
                              decode_row && T > 32, stream_);
-  qwen_mtp_fuse_bf16(mtp_ein_, mtp_enc_, mtp_r_, T, hc, H, stream_);
+  qwen_mtp_fuse_bf16(mtp_ein_, mtp_enc_, mtp_r_, T, hc_fc, H, stream_);
 
   // ---- the draft layer (the stack's objects rebound to its weights) ------
   const QwenLayerResident& r = loader_.load_layer(cfg_.mtp_layer());
@@ -1600,7 +1681,7 @@ void QwenModel::mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos, 
     if (!capture) DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
     boundary_->reduce(buf, T, width);
   };
-  attn_gr_->mix(mtp_r_, x_, T, stream_);
+  attn_site_->mix(mtp_r_, x_, T, stream_);
   uint16_t* attn_out = stage(y_, H);
   {
     QwenQsaCache cache = pool_.view(num_qsa_);
@@ -1616,18 +1697,20 @@ void QwenModel::mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos, 
   }
   if (decode_row) prefetch_ffn_side(r);
   fold(attn_out, H);
-  attn_gr_->combine(mtp_r_, attn_out, T, stream_);
-  mlp_gr_->mix(mtp_r_, x_, T, stream_);
+  attn_site_->combine(mtp_r_, attn_out, T, stream_);
+  mlp_site_->mix(mtp_r_, x_, T, stream_);
   uint16_t* ffn_out = stage(y_, H);
-  if (decode_row)
+  if (!cfg_.has_moe())
+    mlp_->enqueue(x_, T, ffn_out, stream_);
+  else if (decode_row)
     moe_->enqueue_decode(x_, ffn_out, T, stream_, capture ? n_moe_layers_ : -1);
   else if (moe_prefill_host_path_)
     moe_->enqueue(x_, ffn_out, T, stream_);
   else
     moe_->enqueue_prefill(x_, ffn_out, T, stream_);
-  if (decode_row) prefetch_head(globals_.mtp_mixer);
+  if (decode_row) prefetch_head(globals_.mtp_mixer, globals_.mtp_norm);
   fold(ffn_out, H);
-  mlp_gr_->combine(mtp_r_, ffn_out, T, stream_);
+  mlp_site_->combine(mtp_r_, ffn_out, T, stream_);
   if (head_rows == 0) {  // prefill rows fill the cache; no head
     if (decode_row) prefetch_.join(stream_);
     return;
@@ -1635,7 +1718,7 @@ void QwenModel::mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos, 
 
   // ---- head: the draft distribution over the last head_rows rows --------
   uint16_t* head_in = mtp_r_ + static_cast<size_t>(T - head_rows) * W;
-  mtp_mixer_->mix(head_in, h_, head_rows, stream_);
+  mtp_mixer_site_->mix(head_in, h_, head_rows, stream_);
   head_dump_site_ = 1;
   head_req_ = req;
   lm_head_logits(h_, head_rows, stream_);

@@ -971,7 +971,7 @@ DGPP_TEST(qsa_listed_attention_and_gate_match_the_reference) {
                              ptr<uint16_t>(vc), ptr<int32_t>(sf.dreq), ptr<int32_t>(dtopk), g.max_selected(),
                              ptr<int32_t>(dcounts), rows, n_split, g.local_heads, g.kv_heads, g.dim, g.block_tokens,
                              ptr<int32_t>(sf.f.dtable), g.blocks_per_request, 1.0f / 16.0f, mptr<float>(m_ws),
-                             mptr<float>(l_ws), mptr<float>(c_ws), st);
+                             mptr<float>(l_ws), mptr<float>(c_ws), st, /*contiguous=*/false);
       dgpp::dsa_attn_combine(ptr<float>(m_ws), ptr<float>(l_ws), ptr<float>(c_ws), rows, n_split, g.local_heads, g.dim,
                              mptr<float>(c_out), st);
       dgpp::qsa_gate_out(ptr<float>(c_out), ptr<uint16_t>(dqg) + g.dim, q_row_stride, q_head_stride, mptr<uint16_t>(out),
@@ -1079,7 +1079,7 @@ DGPP_TEST(qsa_prefill_partials_preserve_arithmetic_and_graph_replay) {
            ptr<int32_t>(dtopk), stride, ptr<int32_t>(dcounts), rows, splits, heads, kv_heads, dim,
            block_tokens, ptr<int32_t>(dtable), blocks, 1.0f / 16,
            mptr<float>(candidate ? m1 : m0), mptr<float>(candidate ? l1 : l0),
-           mptr<float>(candidate ? c1 : c0), stream);
+           mptr<float>(candidate ? c1 : c0), stream, /*contiguous=*/false);
       };
       launch(false);
       launch(true);
@@ -1154,7 +1154,8 @@ DGPP_TEST(qsa_warp_prefill_matches_the_partial_kernels) {
                                        ptr<int32_t>(dreq), ptr<int32_t>(dtopk), stride,
                                        ptr<int32_t>(dcounts), rows, splits, heads, kv_heads, dim,
                                        block_tokens, ptr<int32_t>(dtable), blocks, 1.0f / 16,
-                                       mptr<float>(m), mptr<float>(l), mptr<float>(c), stream);
+                                       mptr<float>(m), mptr<float>(l), mptr<float>(c), stream,
+                                       /*contiguous=*/false);
         dgpp::dsa_attn_combine(ptr<float>(m), ptr<float>(l), ptr<float>(c), rows, splits, heads, dim,
                                mptr<float>(ref), stream);
         auto warp = [&] {

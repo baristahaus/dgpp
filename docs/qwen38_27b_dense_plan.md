@@ -117,9 +117,13 @@ no special case beyond the visual-tensor skip.
   expected-tensor set when the config has no indexer.
 - MTP: `mtp.fc.weight [5120, 10240]` splits at load into fc_embedding
   (`[:, :5120]`) and fc_hidden (`[:, 5120:]`) halves — same two-GEMV shape
-  Flash-Next binds, so the draft fc path is unchanged code. `pre_fc_norm_*`
-  bind at hidden_size (not hyper_width). No `mtp.hyper_connection_mixer`.
-  The draft layer binds the dense-attention + dense-MLP tensor set.
+  Flash-Next binds, so the draft fc path is unchanged code. The split is
+  three roundings against the reference's one fused fp32 accumulation over
+  `cat[e, h]` — accepted: the draft steers speculation only, the served
+  output stays the trunk's, and the P5 draft-head gate runs tolerance, not
+  bitwise. `pre_fc_norm_*` bind at hidden_size (not hyper_width). No
+  `mtp.hyper_connection_mixer`. The draft layer binds the dense-attention +
+  dense-MLP tensor set.
 - Embedding/lm_head/norm: unchanged. The census' `model.visual.*` tensors
   are skipped explicitly (release-load filter), matching the GLM vision
   precedent.
@@ -206,3 +210,30 @@ no special case beyond the visual-tensor skip.
 - P3: MTP variant.
 - P4: family entry + cluster template + first 2-GPU boot, memory plan fitted.
 - P5: validation gates (forward check, serving parity), benchmarks, notes.
+
+### 6.1 Status (2026-10-03)
+
+P1–P3 landed and gated on the dense twin fixture (`qwen_forward_test
+--write-fixture DIR --dense`): smoke (finite, deterministic) and the full
+13-gate `qwen_decode_test` pass, including graph parity, teacher-forced MTP
+verification and bf12 companions; the Flash-Next suite stays green. Deviations
+and traps found on the way, all resolved in-tree:
+
+- The draft fc runs the Flash-Next two-projection + fuse chain with hc=1
+  (§2's split note) — the fused single-GEMM variant was built and dropped:
+  identical shape to Flash-Next code won (draft-side tolerance, not bitwise).
+- `glm_embed_bcast_kernel` hardcoded GLM's four residual branches; it now
+  takes a branch count (GLM call sites pass 4, the dense form 1).
+- Select-all attention: `attn_partial_kernel`'s `resolve` chased the null
+  `topk` list; the contiguous form reads base+index, as
+  `qsa_select_all_counts` counted. The warp prefill kernel already had it.
+- The plain site's first `build_layer_objects` created the objects but never
+  bound the per-layer norms (the GR branch needed no first-pass bind).
+- `run_rows` computed `W = hc_count * H` (0 in dense): layer captures and the
+  draft's h window sizing now use `hyper_width()`.
+- The constructor, `plan_memory` and `graph_prepare` built MoE machinery
+  unconditionally (`GlmMoeConfig: n_experts must be positive`, null `moe_`);
+  all three gate on `has_moe()`, and the plan adds the dense MLP scratch.
+
+P4/P5 remain: family entry, rxe transport, reference-dump dense variant and
+serving parity.

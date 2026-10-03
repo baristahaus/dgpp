@@ -36,6 +36,10 @@ struct QwenNgramGeometry {
 };
 
 struct QwenTextConfig {
+  // The text_config's own model_type (qwen4_exp_text for the Flash-Next
+  // family, qwen3_5_text for the dense Qwen3.8-27B): the family name and
+  // the text-only vision skip read it back.
+  std::string model_type = "qwen4_exp_text";
   // --- model shape -------------------------------------------------------
   int hidden_size = 2560;
   int vocab_size = 248320;
@@ -51,6 +55,10 @@ struct QwenTextConfig {
   int64_t bos_token_id = -1;
 
   // --- gated residual (hyper-connections) ---------------------------------
+  // hc_count == 0: no gated-residual site (the dense Qwen3.8-27B, whose
+  // layers carry a plain residual). has_gr() gates the site everywhere the
+  // walk composes residual streams; hyper_width() then collapses to
+  // hidden_size so every W-sized buffer keeps working.
   int hc_count = 4;
   int hc_lowrank = 320;
 
@@ -75,6 +83,9 @@ struct QwenTextConfig {
   int indexer_head_dim = 128;
   int indexer_budget = 2048;
   int indexer_compress_ratio = 4;
+  // indexer_n_heads == 0: the attention layers run select-all over the
+  // full history (the dense Qwen3.8-27B ships no indexer tensors).
+  bool has_indexer() const { return indexer_n_heads > 0; }
   // The opt-in YaRN ramp (engine.rope_scaling, 2026-09-18), set by the
   // serving layer on the parsed config — never by the checkpoint, whose
   // rope_parameters must stay `rope_type: default` (the NVIDIA NVFP4
@@ -89,6 +100,10 @@ struct QwenTextConfig {
   int moe_intermediate_size = 640;
   int shared_expert_intermediate_size = 640;
   bool norm_topk_prob = true;
+  // num_experts == 0: the dense SwiGLU MLP (intermediate_size wide), the
+  // Qwen3.8-27B form. has_moe() gates the router/expert path.
+  bool has_moe() const { return num_experts > 0; }
+  int intermediate_size = 0;  // the dense MLP width (required when !has_moe())
 
   // --- n-gram embedding (PLE) -------------------------------------------
   std::vector<int> ple_layer_ids;  // one-indexed decoder layers (the file's convention)
@@ -169,7 +184,11 @@ struct QwenTextConfig {
     return rope_scaling.has_value() ? rope_scaling->context_limit()
                                     : static_cast<int64_t>(max_position_embeddings);
   }
-  int hyper_width() const { return hc_count * hidden_size; }
+  bool has_gr() const { return hc_count > 0; }
+  bool gdn_gate_swish() const { return output_gate_type == "swish"; }
+  // The residual stream's width: the GR site's hc folds, or hidden_size
+  // itself for the plain-residual dense form (Qwen3.8-27B).
+  int hyper_width() const { return hc_count > 0 ? hc_count * hidden_size : hidden_size; }
   // The n-gram table's derivation (§1.7).
   QwenNgramGeometry ngram_geometry() const;
 };

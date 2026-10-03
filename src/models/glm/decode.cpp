@@ -1357,7 +1357,7 @@ GlmDiagnosticModel::Outputs GlmDiagnosticModel::session_run_rows(
   // own start.) One 1-thread kernel; decode rows only.
   if (decode_row) launch_globaltimer_stamp(h_graph_start_gt_, stream_);
   if (!capture_mode) debug_sync("uploads", -1, decode_row);
-  glm_embed_bcast_streams(globals_.embed, step_tokens_, streams_[0], T, H,
+  glm_embed_bcast_streams(globals_.embed, step_tokens_, streams_[0], T, H, 4,
                           stream_);
   if (!decode_row) apply_image_embeddings(streams_[0], token_start, T);
   if (!capture_mode) debug_sync("embed", -1, decode_row);

@@ -47,6 +47,18 @@ std::filesystem::path radixark_snapshot() {
   return {};
 }
 
+std::filesystem::path dense27_snapshot() {
+  // The dense Qwen3.8-27B on the model share (the port's target).
+  namespace fs = std::filesystem;
+  const fs::path root = "/nfs/models--Qwen--Qwen3.8-27B/snapshots";
+  if (!fs::is_directory(root)) return {};
+  for (const auto& snap : fs::directory_iterator(root))
+    if (fs::exists(snap.path() / "config.json") &&
+        fs::exists(snap.path() / "model.safetensors.index.json"))
+      return snap.path();
+  return {};
+}
+
 }  // namespace
 
 DGPP_TEST(qwen_binding_table_has_the_release_shape) {
@@ -65,6 +77,55 @@ DGPP_TEST(qwen_binding_table_has_the_release_shape) {
   require(layer1.size() == layer0.size() + 10 + 128, "the PLE layer adds its 10 tensors and 128 shards");
   const auto draft = dgpp::qwen_expected_layer_tensors(cfg, cfg.mtp_layer());
   require(!draft.empty() && draft[0].name.rfind("mtp.layers.0.", 0) == 0, "the draft layer's prefix");
+}
+
+DGPP_TEST(qwen_binding_table_has_the_dense_27b_shape) {
+  // The dense Qwen3.8-27B's table on the fixture's tiny twin: the per-layer
+  // LayerNorm pairs and the final norm come back, the gated-residual
+  // sites, the indexer and the routed experts are gone, the draft's fc is
+  // one fused matrix over concat(embedding, hidden).
+  const dgpp::QwenTextConfig cfg = qwenfx::tiny_dense_config();
+  const auto table = dgpp::qwen_expected_text_tensors(cfg);
+  // Globals (7): embed, lm_head, the final norm, mtp.fc, the two pre-fc
+  // norms, mtp.norm. GDN layers (3): LN pair + 9 linear_attn + dense MLP.
+  // QSA layers (1 + the draft): LN pair + 6 self_attn + dense MLP.
+  require(table.size() == 7 + 3 * 14 + 2 * 11, "table size " + std::to_string(table.size()));
+  const auto find = [&](const char* name) {
+    for (const auto& e : table)
+      if (e.name == name) return &e;
+    return static_cast<const dgpp::QwenExpectedTensor*>(nullptr);
+  };
+  const auto* ln = find("model.language_model.layers.0.input_layernorm.weight");
+  require(ln && ln->shape == std::vector<int64_t>{256} && ln->dtype == dgpp::DType::BF16,
+          "the per-site input LayerNorm");
+  require(find("model.language_model.layers.0.post_attention_layernorm.weight"),
+          "the per-site post-attention LayerNorm");
+  require(find("model.language_model.norm.weight"), "the model's final norm");
+  const auto* fc = find("mtp.fc.weight");
+  require(fc && fc->shape == std::vector<int64_t>{256, 512}, "the fused draft fc [H, 2H]");
+  require(find("mtp.norm.weight"), "the draft stream's final norm");
+  const auto* mlp = find("model.language_model.layers.0.mlp.gate_proj.weight");
+  require(mlp && mlp->shape == std::vector<int64_t>{64, 256}, "the dense SwiGLU gate");
+  require(find("model.language_model.layers.2.self_attn.q_norm.weight"),
+          "the full-attention layer's head norms");
+  for (const auto& e : table) {
+    require(e.name.find("hyper_connection") == std::string::npos, "no gated-residual sites");
+    require(e.name.find("indexer") == std::string::npos, "no indexer");
+    require(e.name.find("experts") == std::string::npos, "no routed experts");
+    require(e.cls != dgpp::QwenWeightClass::Ple && e.cls != dgpp::QwenWeightClass::PleTable,
+            "no PLE");
+  }
+  // The TP geometry: the dense MLP width slices at the tiny model's worlds
+  // (4 key heads cap it at 4; the release's 16 go to 8 — the landed test).
+  for (const int w : {1, 2, 4})
+    for (int r = 0; r < w; ++r) dgpp::qwen_tp_validate_geometry(cfg, r, w);
+  bool refused = false;
+  try {
+    dgpp::qwen_tp_validate_geometry(cfg, 0, 3);
+  } catch (const std::invalid_argument&) {
+    refused = true;
+  }
+  require(refused, "world 3 refused");
 }
 
 DGPP_TEST(qwen_tp_geometry_accepts_the_deployment_worlds) {
@@ -107,6 +168,40 @@ DGPP_TEST(qwen_binding_validates_the_landed_checkpoint_when_present) {
                         std::to_string(rep.unexpected) + " first: " + first);
   require(rep.vision == 333 && rep.quantized_matrices == 73728 + 1536 && rep.ngram_shards == 128,
           "the census");
+}
+
+DGPP_TEST(qwen_binding_validates_the_dense_27b_when_present) {
+  // The dense release on the model share: every expected tensor present
+  // with its dtype and shape (866), nothing unexpected but the vision
+  // tower (333 — not served by the port, docs/qwen38_27b_dense_plan.md §2).
+  const auto snap = dense27_snapshot();
+  if (snap.empty()) return;
+  namespace fs = std::filesystem;
+  const dgpp::QwenTextConfig cfg = dgpp::QwenTextConfig::from_json_file((snap / "config.json").string());
+  std::unordered_map<std::string, dgpp::QwenTensorDesc> present;
+  std::vector<fs::path> shards;
+  for (const auto& entry : fs::directory_iterator(snap))
+    if (entry.path().extension() == ".safetensors") shards.push_back(entry.path());
+  require(shards.size() == 18, "18 shards");
+  for (const auto& path : shards) {
+    auto f = dgpp::SafetensorsFile::open(path.string());
+    f->for_each([&](const dgpp::TensorInfo& t) {
+      present.emplace(t.name, dgpp::QwenTensorDesc{t.dtype, t.shape});
+    });
+  }
+  require(present.size() == 1199, "1199 tensors in the headers");
+  const dgpp::QwenBindReport rep = dgpp::qwen_validate_text_binding(cfg, present);
+  std::string first = rep.errors.empty() ? "" : rep.errors[0];
+  require(rep.ok(), "dense binding: missing " + std::to_string(rep.missing) + " dtype " +
+                        std::to_string(rep.dtype_mismatch) + " shape " +
+                        std::to_string(rep.shape_mismatch) + " unexpected " +
+                        std::to_string(rep.unexpected) + " first: " + first);
+  require(rep.vision == 333, "the vision census");
+  require(rep.matched == 866 && rep.quantized_matrices == 0 && rep.ngram_shards == 0,
+          "the dense census");
+  // The deployment worlds slice the dense MLP's 17408 rows cleanly.
+  for (const int w : {1, 2, 4, 8})
+    for (int r = 0; r < w; ++r) dgpp::qwen_tp_validate_geometry(cfg, r, w);
 }
 
 DGPP_TEST(qwen_binding_table_has_the_autoround_hybrid_shape) {

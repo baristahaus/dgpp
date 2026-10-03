@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -22,6 +23,8 @@
 #include "kernels/gdn_chunk.hpp"
 #include "kernels/kda.hpp"
 #include "kernels/qsa.hpp"
+#include "kernels/glm_norm.hpp"
+#include "kernels/glm_moe_launch.hpp"
 #include "kernels/rope_scaling.hpp"
 #include "kernels/qwen_gr.hpp"
 #include "kernels/fp8_dequant.hpp"
@@ -212,10 +215,74 @@ QwenGrSite::~QwenGrSite() {
   cudaFree(gates_);
 }
 
-void QwenGrSite::apply_pending(uint16_t* r, const PendingCombine& p, int tokens, int hidden,
-                               cudaStream_t stream) {
+void QwenResidualSite::apply_pending(uint16_t* r, const QwenResidualSite::PendingCombine& p,
+                                    int tokens, int hidden, cudaStream_t stream) {
   if (p.y == nullptr || tokens <= 0) return;
   qwen_gr_combine_apply_bf16(r, p.gates, p.y, tokens, p.hc, hidden, stream);
+}
+
+void QwenPlainSite::mix(uint16_t* r, uint16_t* x, int tokens, cudaStream_t stream,
+                        const PendingCombine* pending) {
+  // The plain form never defers a combine; a pending here means the walk
+  // composed sites across forms.
+  if (pending != nullptr && pending->y != nullptr)
+    throw std::logic_error("QwenPlainSite: a pending combine reaches a plain site");
+  if (tokens <= 0) return;
+  if (!w_) throw std::invalid_argument("QwenPlainSite: null norm weight");
+  qwen_rmsnorm_bf16(r, w_, x, tokens, hidden_, eps_, stream);
+}
+
+void QwenPlainSite::combine(uint16_t* r, const uint16_t* y, int tokens, cudaStream_t stream) {
+  if (tokens <= 0) return;
+  if (!r || !y) throw std::invalid_argument("QwenPlainSite: null combine buffer");
+  glm_residual_add_bf16(r, y, static_cast<int64_t>(tokens) * hidden_, stream);
+}
+
+QwenPlainSite::PendingCombine QwenPlainSite::defer_combine(uint16_t* r, const uint16_t* y, int tokens,
+                                                           cudaStream_t stream) {
+  // No deferral on the plain form: the add rounds R to bf16 before the
+  // next norm reads it either way, and there is no fused apply to hand off.
+  combine(r, y, tokens, stream);
+  return {};
+}
+
+// ---- Dense SwiGLU MLP ---------------------------------------------------------------
+
+QwenDenseMlp::QwenDenseMlp(const QwenMlpResident& w, const QwenGemmWorkspace& gemm, int hidden,
+                           int64_t local_inter, int max_tokens)
+    : w_(w), g_(gemm), hidden_(hidden), max_tokens_(max_tokens), inter_(local_inter) {
+  if (hidden_ <= 0 || inter_ <= 0) throw std::invalid_argument("QwenDenseMlp: null shape");
+  scratch_ = dev_alloc<uint16_t>(static_cast<size_t>(max_tokens_) * static_cast<size_t>(inter_) * 3);
+}
+
+QwenDenseMlp::~QwenDenseMlp() { cudaFree(scratch_); }
+
+size_t QwenDenseMlp::scratch_bytes(int64_t local_inter, int max_tokens) {
+  return static_cast<size_t>(std::max(max_tokens, 0)) *
+         static_cast<size_t>(std::max<int64_t>(local_inter, 0)) * 3 * 2;
+}
+
+void QwenDenseMlp::enqueue(const uint16_t* x, int tokens, uint16_t* out, cudaStream_t stream) {
+  if (tokens <= 0) return;
+  if (tokens > max_tokens_) throw std::invalid_argument("QwenDenseMlp: tokens exceed max_tokens");
+  if (!(w_.gate || w_.fp8[0].payload) || !(w_.up || w_.fp8[1].payload) ||
+      !(w_.down || w_.fp8[2].payload))
+    throw std::invalid_argument("QwenDenseMlp: null weights");
+  const int H = hidden_;
+  const int64_t I = inter_;
+  uint16_t* gate = scratch_;
+  uint16_t* up = scratch_ + static_cast<size_t>(tokens) * I;
+  uint16_t* act = up + static_cast<size_t>(tokens) * I;
+  gemm_dense(g_, x, H, w_.gate, w_.fp8[0], gate, GemmOut::BF16, tokens, static_cast<int>(I), H,
+             stream);
+  gemm_dense(g_, x, H, w_.up, w_.fp8[1], up, GemmOut::BF16, tokens, static_cast<int>(I), H,
+             stream);
+  // The reference's two rounding points: bf16(silu(gate)), then the product
+  // (launch_moe_swiglu_clamp with no clamps is exactly that pair).
+  launch_moe_swiglu_clamp(gate, up, act, static_cast<int64_t>(tokens) * I,
+                          std::numeric_limits<float>::infinity(), stream);
+  gemm_dense(g_, act, I, w_.down, w_.fp8[2], out, GemmOut::BF16, tokens, H, static_cast<int>(I),
+             stream);
 }
 
 QwenGrSite::PendingCombine QwenGrSite::defer_combine(uint16_t* r, const uint16_t* y, int tokens,
@@ -392,7 +459,7 @@ QwenGdnLayer::QwenGdnLayer(const QwenGdnResident& w, const QwenGemmWorkspace& ge
                            const QwenTextConfig& cfg, int max_tokens)
     : w_(w), g_(gemm), hidden_(cfg.hidden_size), lk_(w.local_key_heads), lv_(w.local_value_heads),
       k_dim_(cfg.gdn_key_head_dim), v_dim_(cfg.gdn_value_head_dim), conv_width_(cfg.gdn_conv_width),
-      max_tokens_(max_tokens), eps_(cfg.rms_norm_eps) {
+      max_tokens_(max_tokens), eps_(cfg.rms_norm_eps), gate_swish_(cfg.gdn_gate_swish()) {
   if (!g_.gemm || !g_.ws) throw std::invalid_argument("QwenGdnLayer: GEMM workspace required");
   if (lk_ <= 0 || lv_ <= 0 || lv_ % lk_ != 0)
     throw std::invalid_argument("QwenGdnLayer: value heads must be a multiple of key heads");
@@ -540,7 +607,7 @@ void QwenGdnLayer::enqueue(const uint16_t* x, float* recurrent_state, uint16_t* 
     gdn_recurrent_fwd(qkvc_, a_, lv_, b_, lv_, w_.a_log, w_.dt_bias, recurrent_state, core_, tokens,
                       lv_, lv_ / lk_, k_dim_, v_dim_, scale_, stream, rec_snap, replay);
   gdn_gated_rmsnorm_bf16(core_, z_, w_.norm, normed_, static_cast<int64_t>(tokens) * lv_, v_dim_,
-                         eps_, stream);
+                         eps_, stream, gate_swish_);
   gemm_dense(g_, normed_, LV, w_.out_proj, w_.out_proj_fp8, out, GemmOut::BF16, tokens, H, LV, stream);
 }
 
@@ -567,7 +634,7 @@ void QwenGdnLayer::enqueue_rows(const uint16_t* x, float* rec_states, int64_t re
                             core_, rows, lv_, lv_ / lk_, k_dim_, v_dim_, scale_, requests, stream,
                             rec_snap, replay);
   gdn_gated_rmsnorm_bf16(core_, z_, w_.norm, normed_, static_cast<int64_t>(rows) * lv_, v_dim_,
-                         eps_, stream);
+                         eps_, stream, gate_swish_);
   gemm_dense(g_, normed_, LV, w_.out_proj, w_.out_proj_fp8, out, GemmOut::BF16, rows, H, LV, stream);
 }
 
@@ -600,12 +667,12 @@ QwenQsaLayer::QwenQsaLayer(const QwenQsaResident& w, const QwenGemmWorkspace& ge
       idx_dim_(cfg.indexer_head_dim), kpool_(cfg.indexer_compress_ratio),
       select_k_(cfg.indexer_block_topk()),
       max_selected_(cfg.indexer_budget + cfg.indexer_compress_ratio - 1), max_tokens_(max_tokens),
-      max_pools_(max_pools), eps_(cfg.rms_norm_eps) {
+      max_pools_(max_pools), eps_(cfg.rms_norm_eps), has_idx_(cfg.has_indexer()) {
   if (!g_.gemm || !g_.ws) throw std::invalid_argument("QwenQsaLayer: GEMM workspace required");
   if (lh_ <= 0 || lkv_ <= 0 || lh_ % lkv_ != 0)
     throw std::invalid_argument("QwenQsaLayer: query heads must be a multiple of kv heads");
   if (dim_ != 256) throw std::invalid_argument("QwenQsaLayer: head_dim 256 (the attention kernel's shape)");
-  if (idx_dim_ != 128 || idx_heads_ < 1 || idx_heads_ > 4 || cfg.indexer_kv_heads != 1)
+  if (has_idx_ && (idx_dim_ != 128 || idx_heads_ < 1 || idx_heads_ > 4 || cfg.indexer_kv_heads != 1))
     throw std::invalid_argument("QwenQsaLayer: indexer <= 4 heads x 128, one key head");
   if (max_pools_ <= 0) throw std::invalid_argument("QwenQsaLayer: max_pools must be positive");
   scale_ = static_cast<float>(std::pow(static_cast<double>(dim_), -0.5));
@@ -630,13 +697,16 @@ QwenQsaLayer::QwenQsaLayer(const QwenQsaResident& w, const QwenGemmWorkspace& ge
   v_ = dev_alloc<uint16_t>(M * static_cast<size_t>(lkv_) * dim_);
   qn_ = dev_alloc<uint16_t>(M * static_cast<size_t>(lh_) * dim_);
   kn_ = dev_alloc<uint16_t>(M * static_cast<size_t>(lkv_) * dim_);
-  idx_ = dev_alloc<uint16_t>(M * static_cast<size_t>(idx_heads_ + 1) * idx_dim_);
-  qi_ = dev_alloc<uint16_t>(M * static_cast<size_t>(idx_heads_) * idx_dim_);
-  keys_ws_ = dev_alloc<uint64_t>(M * static_cast<size_t>(max_pools_));
-  topk_ = dev_alloc<int32_t>(M * static_cast<size_t>(max_selected_));
+  if (has_idx_) {
+    idx_ = dev_alloc<uint16_t>(M * static_cast<size_t>(idx_heads_ + 1) * idx_dim_);
+    qi_ = dev_alloc<uint16_t>(M * static_cast<size_t>(idx_heads_) * idx_dim_);
+    keys_ws_ = dev_alloc<uint64_t>(M * static_cast<size_t>(max_pools_));
+    topk_ = dev_alloc<int32_t>(M * static_cast<size_t>(max_selected_));
+  }
   counts_ = dev_alloc<int32_t>(M);
-  // Splits over the list: 256 tokens each, at most 8.
-  n_split_ = std::max(1, std::min(8, (max_selected_ + 255) / 256));
+  // Splits over the list: 256 tokens each, at most 8. The select-all form
+  // has no list budget; a fixed 8 covers any context the pool holds.
+  n_split_ = has_idx_ ? std::max(1, std::min(8, (max_selected_ + 255) / 256)) : 8;
   const size_t part = M * static_cast<size_t>(n_split_) * lh_;
   m_ws_ = dev_alloc<float>(part);
   l_ws_ = dev_alloc<float>(part);
@@ -679,19 +749,21 @@ void QwenQsaLayer::enqueue(const uint16_t* x, int tokens, const QwenQsaRows& row
     if (!rows.spans || rows.num_requests <= 0)
       throw std::invalid_argument("QwenQsaLayer: decode rows need request spans");
   } else {
-    if (rows.pos0 < 0 || rows.pos0 % kpool_ != 0)
+    if (rows.pos0 < 0 || (has_idx_ && rows.pos0 % kpool_ != 0))
       throw std::invalid_argument("QwenQsaLayer: pos0 must be a non-negative multiple of kpool");
     if (rows.request < 0 || rows.request >= cache.max_requests)
       throw std::invalid_argument("QwenQsaLayer: request outside the cache");
     if (rows.pos0 + tokens > cache.slots())
       throw std::invalid_argument("QwenQsaLayer: the prefill overruns the cache");
-    if ((rows.pos0 + tokens + kpool_ - 1) / kpool_ > max_pools_)
+    if (has_idx_ && (rows.pos0 + tokens + kpool_ - 1) / kpool_ > max_pools_)
       throw std::invalid_argument("QwenQsaLayer: visible pools exceed the scoring workspace");
   }
   if (!(w_.q_proj || w_.q_proj_fp8.payload) || !(w_.k_proj || w_.k_proj_fp8.payload) ||
-      !(w_.v_proj || w_.v_proj_fp8.payload) || !(w_.o_proj || w_.o_proj_fp8.payload) || !w_.q_norm || !w_.k_norm ||
-      !(w_.index_qk_proj || w_.index_qk_proj_fp8.payload) || !w_.index_q_norm || !w_.index_k_norm)
+      !(w_.v_proj || w_.v_proj_fp8.payload) || !(w_.o_proj || w_.o_proj_fp8.payload) || !w_.q_norm || !w_.k_norm)
     throw std::invalid_argument("QwenQsaLayer: null weights");
+  if (has_idx_ &&
+      (!(w_.index_qk_proj || w_.index_qk_proj_fp8.payload) || !w_.index_q_norm || !w_.index_k_norm))
+    throw std::invalid_argument("QwenQsaLayer: null indexer weights");
   const int H = hidden_, D = dim_, Di = idx_dim_, T = tokens;
   const int QW = lh_ * 2 * D, KW = lkv_ * D, IW = (idx_heads_ + 1) * Di;
   const int32_t* d_req = rows.req_ids;
@@ -709,7 +781,7 @@ void QwenQsaLayer::enqueue(const uint16_t* x, int tokens, const QwenQsaRows& row
     p[1].payload = w_.k_proj_fp8.payload; p[1].scales = w_.k_proj_fp8.scales; p[1].out = k_; p[1].n = KW;
     p[2].payload = w_.v_proj_fp8.payload; p[2].scales = w_.v_proj_fp8.scales; p[2].out = v_; p[2].n = KW;
     int np = 3;
-    if (w_.index_qk_proj_fp8.payload) {
+    if (has_idx_ && w_.index_qk_proj_fp8.payload) {
       p[3].payload = w_.index_qk_proj_fp8.payload; p[3].scales = w_.index_qk_proj_fp8.scales; p[3].out = idx_; p[3].n = IW;
       np = 4;
     }
@@ -720,42 +792,49 @@ void QwenQsaLayer::enqueue(const uint16_t* x, int tokens, const QwenQsaRows& row
     gemm_dense(g_, x, H, w_.q_proj, w_.q_proj_fp8, q_, GemmOut::BF16, T, QW, H, stream);
     gemm_dense(g_, x, H, w_.k_proj, w_.k_proj_fp8, k_, GemmOut::BF16, T, KW, H, stream);
     gemm_dense(g_, x, H, w_.v_proj, w_.v_proj_fp8, v_, GemmOut::BF16, T, KW, H, stream);
-    gemm_dense(g_, x, H, w_.index_qk_proj, w_.index_qk_proj_fp8, idx_, GemmOut::BF16, T, IW, H, stream);
+    if (has_idx_)
+      gemm_dense(g_, x, H, w_.index_qk_proj, w_.index_qk_proj_fp8, idx_, GemmOut::BF16, T, IW, H, stream);
   }
   // Norm + RoPE: q (the [q | gate] interleave), k, the indexer q.
   qsa_norm_rope_bf16(q_, QW, 2 * D, w_.q_norm, d_pos, d_inv_freq_, qn_, static_cast<int64_t>(lh_) * D,
                      T, lh_, D, rotary_, eps_, mscale_, stream);
   qsa_norm_rope_bf16(k_, KW, D, w_.k_norm, d_pos, d_inv_freq_, kn_, KW, T, lkv_, D, rotary_, eps_,
                      mscale_, stream);
-  qsa_norm_rope_bf16(idx_, IW, Di, w_.index_q_norm, d_pos, d_inv_freq_, qi_,
-                     static_cast<int64_t>(idx_heads_) * Di, T, idx_heads_, Di, rotary_, eps_,
-                     mscale_, stream);
   // The caches: K/V rows, then the compressed keys and the ring.
   qsa_kv_append(kn_, KW, v_, KW, d_req, d_pos, T, cache.block_tables, cache.blocks_per_request,
                 cache.block_tokens, lkv_, D, cache.k_cache, cache.v_cache, stream);
-  const int pools_per_block = cache.block_tokens / kpool_;
-  const uint16_t* raw_k = idx_ + static_cast<int64_t>(idx_heads_) * Di;
-  if (rows.decode) {
-    qsa_index_decode_update(raw_k, IW, w_.index_k_norm, d_inv_freq_, d_req, d_pos, rows.spans,
-                            rows.num_requests, cache.block_tables, cache.blocks_per_request,
-                            cache.ring, cache.index_cache, pools_per_block, kpool_, Di, rotary_,
-                            eps_, mscale_, stream, rows.ring_snapshots);
+  if (has_idx_) {
+    qsa_norm_rope_bf16(idx_, IW, Di, w_.index_q_norm, d_pos, d_inv_freq_, qi_,
+                       static_cast<int64_t>(idx_heads_) * Di, T, idx_heads_, Di, rotary_, eps_,
+                       mscale_, stream);
+    const int pools_per_block = cache.block_tokens / kpool_;
+    const uint16_t* raw_k = idx_ + static_cast<int64_t>(idx_heads_) * Di;
+    if (rows.decode) {
+      qsa_index_decode_update(raw_k, IW, w_.index_k_norm, d_inv_freq_, d_req, d_pos, rows.spans,
+                              rows.num_requests, cache.block_tables, cache.blocks_per_request,
+                              cache.ring, cache.index_cache, pools_per_block, kpool_, Di, rotary_,
+                              eps_, mscale_, stream, rows.ring_snapshots);
+    } else {
+      const int32_t* table =
+          cache.block_tables + static_cast<int64_t>(rows.request) * cache.blocks_per_request;
+      qsa_index_compress_write(raw_k, IW, w_.index_k_norm, d_inv_freq_, table, pools_per_block,
+                               rows.pos0 / kpool_, T / kpool_, cache.index_cache, kpool_, Di, rotary_,
+                               eps_, mscale_, stream);
+      qsa_index_tail_seed(raw_k, IW, d_req, d_pos, T, cache.ring, kpool_, Di, stream);
+    }
+    // Score only rows that need a selection, then expand pools and attend.
+    // Prefill positions are fixed here; decode graph positions can grow on replay.
+    qsa_index_score(qi_, static_cast<int64_t>(idx_heads_) * Di, d_req, d_pos, T, cache.block_tables,
+                    cache.blocks_per_request, cache.index_cache, pools_per_block, idx_heads_, Di,
+                    kpool_, keys_ws_, max_pools_, stream, rows.decode ? -1 : (rows.pos0 + T) / kpool_,
+                    select_k_);
+    qsa_select_from_keys(keys_ws_, max_pools_, d_pos, T, select_k_, kpool_, max_selected_, topk_,
+                         counts_, stream);
   } else {
-    const int32_t* table =
-        cache.block_tables + static_cast<int64_t>(rows.request) * cache.blocks_per_request;
-    qsa_index_compress_write(raw_k, IW, w_.index_k_norm, d_inv_freq_, table, pools_per_block,
-                             rows.pos0 / kpool_, T / kpool_, cache.index_cache, kpool_, Di, rotary_,
-                             eps_, mscale_, stream);
-    qsa_index_tail_seed(raw_k, IW, d_req, d_pos, T, cache.ring, kpool_, Di, stream);
+    // The select-all form (the dense 27B): every token up to the row's
+    // position attends, ids read as base + index in the kernels.
+    qsa_select_all_counts(d_pos, T, counts_, stream);
   }
-  // Score only rows that need a selection, then expand pools and attend.
-  // Prefill positions are fixed here; decode graph positions can grow on replay.
-  qsa_index_score(qi_, static_cast<int64_t>(idx_heads_) * Di, d_req, d_pos, T, cache.block_tables,
-                  cache.blocks_per_request, cache.index_cache, pools_per_block, idx_heads_, Di,
-                  kpool_, keys_ws_, max_pools_, stream, rows.decode ? -1 : (rows.pos0 + T) / kpool_,
-                  select_k_);
-  qsa_select_from_keys(keys_ws_, max_pools_, d_pos, T, select_k_, kpool_, max_selected_, topk_,
-                       counts_, stream);
   // Small grids do not amortize the wider head group. Keep decode/verify and
   // short prefills on their existing kernel; both paths use identical arithmetic.
   // Long prefill walks take the one-warp tensor-core kernel
@@ -766,15 +845,17 @@ void QwenQsaLayer::enqueue(const uint16_t* x, int tokens, const QwenQsaRows& row
     const char* e = std::getenv("DGPP_QSA_WARP");
     return !(e != nullptr && e[0] == '0');
   }();
+  const int32_t* toks = has_idx_ ? topk_ : nullptr;
+  const int toks_stride = has_idx_ ? max_selected_ : 0;
   if (warp_attn && !rows.decode && T >= 128 && qsa_warp_supported(D, lh_, lkv_)) {
-    qsa_attn_prefill_warp(qn_, static_cast<int64_t>(lh_) * D, cache.k_cache, cache.v_cache, d_req, topk_,
-                          max_selected_, counts_, T, lh_, lkv_, cache.block_tokens, cache.block_tables,
-                          cache.blocks_per_request, scale_, c_out_, stream);
+    qsa_attn_prefill_warp(qn_, static_cast<int64_t>(lh_) * D, cache.k_cache, cache.v_cache, d_req, toks,
+                          toks_stride, counts_, T, lh_, lkv_, cache.block_tokens, cache.block_tables,
+                          cache.blocks_per_request, scale_, c_out_, stream, !has_idx_);
   } else {
     const auto attend = !rows.decode && T >= 128 ? qsa_attn_prefill_partial : qsa_attn_partial;
-    attend(qn_, static_cast<int64_t>(lh_) * D, cache.k_cache, cache.v_cache, d_req, topk_,
-           max_selected_, counts_, T, n_split_, lh_, lkv_, D, cache.block_tokens,
-           cache.block_tables, cache.blocks_per_request, scale_, m_ws_, l_ws_, c_ws_, stream);
+    attend(qn_, static_cast<int64_t>(lh_) * D, cache.k_cache, cache.v_cache, d_req, toks,
+           toks_stride, counts_, T, n_split_, lh_, lkv_, D, cache.block_tokens,
+           cache.block_tables, cache.blocks_per_request, scale_, m_ws_, l_ws_, c_ws_, stream, !has_idx_);
     dsa_attn_combine(m_ws_, l_ws_, c_ws_, T, n_split_, lh_, D, c_out_, stream);
   }
   qsa_gate_out(c_out_, q_ + D, QW, 2 * D, o_, T, lh_, D, stream);
@@ -789,12 +870,18 @@ size_t QwenQsaLayer::scratch_bytes(const QwenTextConfig& cfg, int local_heads, i
   const size_t D = static_cast<size_t>(cfg.head_dim), Di = static_cast<size_t>(cfg.indexer_head_dim);
   const size_t nH = static_cast<size_t>(cfg.indexer_n_heads);
   const size_t max_selected = static_cast<size_t>(cfg.indexer_budget + cfg.indexer_compress_ratio - 1);
-  const size_t n_split = static_cast<size_t>(std::max<size_t>(1, std::min<size_t>(8, (max_selected + 255) / 256)));
+  const size_t n_split = cfg.has_indexer()
+                             ? std::max<size_t>(1, std::min<size_t>(8, (max_selected + 255) / 256))
+                             : 8;
   size_t b = 0;
-  b += M * (lh * 2 * D + 2 * lkv * D + lh * D + lkv * D + (nH + 1) * Di + nH * Di) * 2;  // q, k, v, qn, kn, idx, qi
-  b += M * static_cast<size_t>(std::max<int64_t>(max_pools, 0)) * 8;                    // keys_ws
-  b += M * max_selected * 4 + M * 4;                                                    // topk, counts
-  b += 2 * M * n_split * lh * 4 + M * n_split * lh * D * 4;                             // m, l, c partials
+  b += M * (lh * 2 * D + 2 * lkv * D + lh * D + lkv * D) * 2;                            // q, k, v, qn, kn
+  if (cfg.has_indexer()) {
+    b += M * ((nH + 1) * Di + nH * Di) * 2;                                              // idx, qi
+    b += M * static_cast<size_t>(std::max<int64_t>(max_pools, 0)) * 8;                    // keys_ws
+    b += M * max_selected * 4;                                                            // topk
+  }
+  b += M * 4;                                                                            // counts
+  b += 2 * M * n_split * lh * 4 + M * n_split * lh * D * 4;                               // m, l, c partials
   b += M * lh * D * 4 + M * lh * D * 2;                                                 // c_out, o
   return b;
 }

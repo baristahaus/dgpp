@@ -470,7 +470,7 @@ __global__ void attn_partial_kernel(const uint16_t* __restrict__ q, int64_t q_ro
                                     const int32_t* __restrict__ block_tables,
                                     int blocks_per_request, float scale, float* __restrict__ m_ws,
                                     float* __restrict__ l_ws, float* __restrict__ c_ws,
-                                    int async_gather) {
+                                    int async_gather, bool contiguous) {
   constexpr int kGroups = 32;
   constexpr int kDslice = D / kGroups;  // 8 at D=256
   constexpr int kRowStride = D + 8;     // padded smem row (u16)
@@ -551,7 +551,10 @@ __global__ void attn_partial_kernel(const uint16_t* __restrict__ q, int64_t q_ro
   constexpr int kGatherBatch = 12;
   const auto resolve = [&](int t0, int n, int64_t* phys) {
     if (static_cast<int>(threadIdx.x) < n) {
-      const int64_t tok = toks[t0 + threadIdx.x];
+      // The select-all form has no list: the row's tokens are the ids
+      // themselves (base + index), as select_all_counts counted them.
+      const int64_t tok =
+          contiguous ? t0 + threadIdx.x : toks[t0 + static_cast<int>(threadIdx.x)];
       const int32_t blk = bt[tok / block_tokens];
       phys[threadIdx.x] = static_cast<int64_t>(blk) * block_tokens + tok % block_tokens;
     }
@@ -871,15 +874,35 @@ void qsa_select_from_keys(const uint64_t* keys_ws, int64_t ws_stride, const int6
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
+// The select-all form (no indexer): every token up to and including the
+// row's position is the list — the attention kernels' contiguous=true reads
+// ids as base + index, so only the counts are needed. Negative positions
+// (rows outside the request) select nothing.
+__global__ void select_all_counts_kernel(const int64_t* __restrict__ pos, int32_t* __restrict__ out,
+                                        int rows) {
+  const int r = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (r < rows) out[r] = pos[r] < 0 ? 0 : static_cast<int32_t>(pos[r]) + 1;
+}
+
+void qsa_select_all_counts(const int64_t* pos, int rows, int32_t* out_counts, cudaStream_t stream) {
+  if (rows <= 0) return;
+  if (!pos || !out_counts) throw std::invalid_argument("qsa_select_all_counts: null pointer");
+  const int block = 128;
+  const unsigned grid = (static_cast<unsigned>(rows) + block - 1) / block;
+  select_all_counts_kernel<<<grid, block, 0, stream>>>(pos, out_counts, rows);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
 void qsa_attn_partial(const uint16_t* q, int64_t q_row_stride, const uint16_t* k_cache,
                       const uint16_t* v_cache, const int32_t* req_ids, const int32_t* topk,
                       int topk_stride, const int32_t* counts, int rows, int n_split,
                       int local_heads, int kv_heads, int dim, int block_tokens,
                       const int32_t* block_tables, int blocks_per_request, float scale,
-                      float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream) {
+                      float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream,
+                      bool contiguous) {
   qsa_attn_partial_gather(q, q_row_stride, k_cache, v_cache, req_ids, topk, topk_stride, counts, rows,
                           n_split, local_heads, kv_heads, dim, block_tokens, block_tables,
-                          blocks_per_request, scale, m_ws, l_ws, c_ws, stream, -1, 0, 0);
+                          blocks_per_request, scale, m_ws, l_ws, c_ws, stream, -1, 0, 0, contiguous);
 }
 
 void qsa_attn_partial_gather(const uint16_t* q, int64_t q_row_stride, const uint16_t* k_cache,
@@ -888,10 +911,11 @@ void qsa_attn_partial_gather(const uint16_t* q, int64_t q_row_stride, const uint
                              int local_heads, int kv_heads, int dim, int block_tokens,
                              const int32_t* block_tables, int blocks_per_request, float scale,
                              float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream,
-                             int async_gather, int heads_per_block, int heads_per_warp) {
+                             int async_gather, int heads_per_block, int heads_per_warp,
+                             bool contiguous) {
   if (rows <= 0) return;
-  if (!q || !k_cache || !v_cache || !req_ids || !topk || !counts || !block_tables || !m_ws ||
-      !l_ws || !c_ws)
+  if (!q || !k_cache || !v_cache || !req_ids || (!topk && !contiguous) || !counts ||
+      !block_tables || !m_ws || !l_ws || !c_ws)
     throw std::invalid_argument("qsa_attn_partial: null pointer");
   if (kv_heads <= 0 || local_heads % kv_heads != 0)
     throw std::invalid_argument("qsa_attn_partial: local_heads must be a multiple of kv_heads");
@@ -930,7 +954,8 @@ void qsa_attn_partial_gather(const uint16_t* q, int64_t q_row_stride, const uint
     constexpr int H = decltype(hpw_tag)::value;
     attn_partial_kernel<D, H><<<grid, threads, smem, stream>>>(
         q, q_row_stride, k_cache, v_cache, req_ids, topk, topk_stride, counts, n_split, local_heads,
-        kv_heads, block_tokens, block_tables, blocks_per_request, scale, m_ws, l_ws, c_ws, async_gather);
+        kv_heads, block_tokens, block_tables, blocks_per_request, scale, m_ws, l_ws, c_ws, async_gather,
+        contiguous);
   };
   const auto by_hpw = [&](auto dim_tag) {
     switch (hpw) {
