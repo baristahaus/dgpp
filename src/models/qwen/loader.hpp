@@ -140,6 +140,7 @@ struct QwenMlpResident {
   const uint16_t* up = nullptr;    // BF16 [I/W, hidden]
   const uint16_t* down = nullptr;  // BF16 [hidden, I/W] (packed columns)
   GlmQuantMatrix fp8[3];           // dense_weights fp8: the same three
+  GlmFp4Matrix fp4[3];             // dense_weights nvfp4: the same three (the rest stays fp8)
   int64_t local_inter = 0;         // I/W
 };
 
@@ -329,6 +330,16 @@ class QwenLayerStream : public ResidentLayerStream<QwenLoaderFamily> {
   // stream is built; the memory plan and the resident image key follow it.
   static void set_dense_weights_fp8(bool on);
   static bool dense_weights_fp8();
+  // The dense MLP's at-load NVFP4 form (2026-10-03, engine.dense_weights =
+  // "nvfp4", docs/qwen38_dual_spark.md): every dense SwiGLU (the dense
+  // 27B's and the draft layer's) encoded to the modelopt NVFP4 triple —
+  // 4.9 GB a rank at world 2, the difference between fitting a 16 GB
+  // board and not — while every other dense projection keeps the block-FP8
+  // form (requires set_dense_weights_fp8). The BF16 releases only: a
+  // shipped-FP8 checkpoint keeps its form. Set before the stream is
+  // built; the memory plan and the resident image key follow it.
+  static void set_dense_mlp_nvfp4(bool on);
+  static bool dense_mlp_nvfp4();
   // The opt-in fp8 prefill GEMM (2026-09-30, engine.prefill_fp8_gemm; NOT
   // bitwise): a prefill-shaped dense product under dense_weights = fp8
   // runs on the fp8 tensor cores (kernels/fp8_gemm: per-token 1 x 128

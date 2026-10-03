@@ -162,6 +162,12 @@ class QwenModel : public SessionModel<QwenModel> {
   static constexpr int kv_block_tokens_static() { return kBlockTokens; }
   // The same number for a shape that is not built yet (the memory plan).
   static size_t session_snapshot_bytes(const QwenTextConfig& cfg, int tp_world, bool mtp);
+  // The FP8 dense stack's prefill bridge, in bytes: the largest dense
+  // matrix of this rank's slice in BF16 (the MLP's slice included under
+  // engine.dense_weights = "nvfp4", which has no scale-GEMM fallback —
+  // gemm_dense_fp4 dequantizes into it or fails). Public for the decode
+  // test's world-2 shape gate (docs/qwen38_dual_spark.md).
+  static size_t dense_bridge_bytes(const QwenTextConfig& cfg, const QwenLocalGeometry& geo);
   using Base::session_snapshot_bytes;
 
   const QwenTextConfig& config() const { return cfg_; }
@@ -266,7 +272,6 @@ class QwenModel : public SessionModel<QwenModel> {
   void build_layer_objects(const QwenLayerResident& r);
   void lm_head_logits(const uint16_t* hidden, int rows, cudaStream_t stream, bool last_row_only = false,
                       int compact_row = -1, int output_row = 0);
-  static size_t dense_bridge_bytes(const QwenTextConfig& cfg, const QwenLocalGeometry& geo);
   // The opt-in fp8 prefill GEMM's activation scratch (engine.prefill_fp8_gemm):
   // the widest dense k of this rank's slice, and the scratch's bytes for
   // max_tokens rows (e4m3 rows plus their 1 x 128 fp32 scales).

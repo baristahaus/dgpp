@@ -29,6 +29,8 @@
 #include "kernels/qwen_gr.hpp"
 #include "kernels/fp8_dequant.hpp"
 #include "kernels/fp8_gemm.hpp"
+#include "kernels/fp4_dequant.hpp"
+#include "kernels/fp4_gemv.hpp"
 #include "kernels/scale_gemm.hpp"
 #include "kernels/qwen_norm.hpp"
 #include "kernels/qwen_ple.hpp"
@@ -112,8 +114,37 @@ void gemm_dense(const QwenGemmWorkspace& g, const uint16_t* act, int64_t act_str
                              g.ws, g.ws_bytes);
     return;
   }
-  if (!w) throw std::invalid_argument("qwen dense: null weight");
+  if (!w) throw std::invalid_argument("qwen dense: null weight (m " + std::to_string(m) + ", n " +
+                                       std::to_string(n) + ", k " + std::to_string(k) + ")");
   gemm_bf16(g, act, act_stride, w, out, out_type, m, n, k, stream);
+}
+
+// A dense projection in the at-load NVFP4 form (engine.dense_weights =
+// "nvfp4", the dense MLP's three matrices): decode-shaped rows through the
+// single-matrix fp4 GEMV (kernels/fp4_gemv.hpp — bf16 activations, bitwise
+// invariant to m), prefill-shaped rows over the dequantized BF16 bridge —
+// the fp8 bridge's fp4 twin, one dequant per chunk instead of per step.
+// The bridge must hold the matrix (QwenModel::dense_bridge_bytes sizes it
+// for the largest dense matrix of the rank, the MLP included under nvfp4).
+void gemm_dense_fp4(const QwenGemmWorkspace& g, const uint16_t* act, int64_t act_stride,
+                    const GlmFp4Matrix& w4, uint16_t* out, int m, int n, int k,
+                    cudaStream_t stream) {
+  if (w4.rows != n || w4.cols != k)
+    throw std::invalid_argument("qwen dense fp4: the matrix's shape disagrees with the product");
+  if (!fp4_gemv_accepts(w4))
+    throw std::invalid_argument(
+        "qwen dense fp4: K = " + std::to_string(k) +
+        " is outside the fp4 GEMV's compiled set (the dual-spark world is 2; world 1's MLP "
+        "down is not compiled and keeps the fp8 form)");
+  if (m <= 128) {
+    launch_fp4_gemv_bf16(act, static_cast<size_t>(act_stride), w4, out, m, n, k, stream);
+    return;
+  }
+  const size_t bf16_bytes = static_cast<size_t>(n) * static_cast<size_t>(k) * 2;
+  if (!g.dequant || bf16_bytes > g.dequant_bytes)
+    throw std::invalid_argument("qwen dense fp4: the prefill bridge is smaller than the matrix");
+  launch_fp4_dequant(w4.payload, w4.scales, w4.global_scale, g.dequant, n, k, stream);
+  gemm_bf16(g, act, act_stride, g.dequant, out, GemmOut::BF16, m, n, k, stream);
 }
 
 }  // namespace
@@ -252,6 +283,17 @@ QwenDenseMlp::QwenDenseMlp(const QwenMlpResident& w, const QwenGemmWorkspace& ge
                            int64_t local_inter, int max_tokens)
     : w_(w), g_(gemm), hidden_(hidden), max_tokens_(max_tokens), inter_(local_inter) {
   if (hidden_ <= 0 || inter_ <= 0) throw std::invalid_argument("QwenDenseMlp: null shape");
+  if (w_.fp4[0].payload &&  // the at-load NVFP4 form: every K must be in the
+      // fp4 GEMV's compiled set at this world (docs/qwen38_dual_spark.md:
+      // the dual-spark world is 2 — 8704 and 5120 are compiled; world 1's
+      // 17408 and world 4's 4352 are not, and those keep the fp8 form).
+      !(fp4_gemv_accepts(w_.fp4[0]) && fp4_gemv_accepts(w_.fp4[1]) &&
+        fp4_gemv_accepts(w_.fp4[2])))
+    throw std::invalid_argument(
+        "QwenDenseMlp: engine.dense_weights = nvfp4 needs the MLP's Ks in the fp4 GEMV's "
+        "compiled set (gate/up K = " +
+        std::to_string(hidden_) + ", down K = " + std::to_string(inter_) +
+        "); run this form at world 2 or keep fp8");
   scratch_ = dev_alloc<uint16_t>(static_cast<size_t>(max_tokens_) * static_cast<size_t>(inter_) * 3);
 }
 
@@ -265,14 +307,25 @@ size_t QwenDenseMlp::scratch_bytes(int64_t local_inter, int max_tokens) {
 void QwenDenseMlp::enqueue(const uint16_t* x, int tokens, uint16_t* out, cudaStream_t stream) {
   if (tokens <= 0) return;
   if (tokens > max_tokens_) throw std::invalid_argument("QwenDenseMlp: tokens exceed max_tokens");
-  if (!(w_.gate || w_.fp8[0].payload) || !(w_.up || w_.fp8[1].payload) ||
-      !(w_.down || w_.fp8[2].payload))
+  if (!(w_.gate || w_.fp8[0].payload || w_.fp4[0].payload) ||
+      !(w_.up || w_.fp8[1].payload || w_.fp4[1].payload) ||
+      !(w_.down || w_.fp8[2].payload || w_.fp4[2].payload))
     throw std::invalid_argument("QwenDenseMlp: null weights");
   const int H = hidden_;
   const int64_t I = inter_;
   uint16_t* gate = scratch_;
   uint16_t* up = scratch_ + static_cast<size_t>(tokens) * I;
   uint16_t* act = up + static_cast<size_t>(tokens) * I;
+  if (w_.fp4[0].payload) {  // engine.dense_weights = "nvfp4": the MLP's three
+    gemm_dense_fp4(g_, x, H, w_.fp4[0], gate, tokens, static_cast<int>(I), H, stream);
+    gemm_dense_fp4(g_, x, H, w_.fp4[1], up, tokens, static_cast<int>(I), H, stream);
+    // The reference's two rounding points: bf16(silu(gate)), then the product
+    // (launch_moe_swiglu_clamp with no clamps is exactly that pair).
+    launch_moe_swiglu_clamp(gate, up, act, static_cast<int64_t>(tokens) * I,
+                            std::numeric_limits<float>::infinity(), stream);
+    gemm_dense_fp4(g_, act, I, w_.fp4[2], out, tokens, H, static_cast<int>(I), stream);
+    return;
+  }
   gemm_dense(g_, x, H, w_.gate, w_.fp8[0], gate, GemmOut::BF16, tokens, static_cast<int>(I), H,
              stream);
   gemm_dense(g_, x, H, w_.up, w_.fp8[1], up, GemmOut::BF16, tokens, static_cast<int>(I), H,
@@ -786,7 +839,12 @@ void QwenQsaLayer::enqueue(const uint16_t* x, int tokens, const QwenQsaRows& row
       np = 4;
     }
     launch_scale_gemv_multi_bf16(p, np, x, static_cast<size_t>(H), T, H, stream);
-    if (np == 3)
+    // np == 3 with an indexer is the AutoRound hybrid (the indexer's
+    // projection ships in BF16): it takes the dense path below. Without
+    // one (the dense form's QSA, has_idx_ false) there is no fourth problem
+    // at all — the indexer's weights are null and the dense path must not
+    // run (2026-10-03: the dense twin under fp8 dense weights tripped it).
+    if (np == 3 && has_idx_)
       gemm_dense(g_, x, H, w_.index_qk_proj, w_.index_qk_proj_fp8, idx_, GemmOut::BF16, T, IW, H, stream);
   } else {
     gemm_dense(g_, x, H, w_.q_proj, w_.q_proj_fp8, q_, GemmOut::BF16, T, QW, H, stream);

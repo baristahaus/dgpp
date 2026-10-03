@@ -63,9 +63,11 @@ struct ClusterConfig {
     // tensors are taken from it. Empty: the checkpoint's own shards.
     std::string ngram_table_model;
     // The Qwen dense stack's form: "checkpoint" (the default:
-    // the BF16 the checkpoint ships) or "fp8" (every dense projection
+    // the BF16 the checkpoint ships), "fp8" (every dense projection
     // encoded to block FP8 at load — the same recipe as the FP8 releases;
-    // docs/qwen38_single_spark.md).
+    // docs/qwen38_single_spark.md) or "nvfp4" (the fp8 stack's dense
+    // SwiGLU MLPs further encoded to the modelopt NVFP4 triple at load —
+    // the dense 27B's biggest matrices; docs/qwen38_dual_spark.md).
     std::string dense_weights = "checkpoint";
     std::string fp8_head = "gemv";  // Qwen head: gemv | mma (opt-in)
     // The MTP draft layer's routed-expert layout: "fp8" (the default:

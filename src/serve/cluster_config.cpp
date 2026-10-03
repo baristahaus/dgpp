@@ -201,8 +201,8 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         }
         else if (p.key == "dense_weights") {
           e.dense_weights = text(x, ek, what);
-          if (e.dense_weights != "checkpoint" && e.dense_weights != "fp8")
-            fail(what, "'" + ek + "' must be \"checkpoint\" or \"fp8\"");
+          if (e.dense_weights != "checkpoint" && e.dense_weights != "fp8" && e.dense_weights != "nvfp4")
+            fail(what, "'" + ek + "' must be \"checkpoint\", \"fp8\" or \"nvfp4\"");
         }
         else if (p.key == "fp8_head") {
           e.fp8_head = text(x, ek, what);

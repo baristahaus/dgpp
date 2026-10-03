@@ -102,7 +102,9 @@ QwenModel::QwenModel(const QwenTextConfig& cfg, const std::string& checkpoint_di
   gw_ = QwenGemmWorkspace{&gemm_, gemm_ws_, gemm_ws_bytes_};
   if (QwenLayerStream::dense_weights_fp8()) {
     // The FP8 dense stack's prefill bridge: the largest dense matrix of
-    // this rank's slice, in BF16.
+    // this rank's slice, in BF16. Under engine.dense_weights = "nvfp4" the
+    // MLP's dequantized form shares it, and the MLP's slice bounds the
+    // list (dense_bridge_bytes takes it under the knob).
     dense_bridge_bytes_ = dense_bridge_bytes(cfg_, loader_.geometry());
     gw_.dequant = dev_alloc<uint16_t>(dense_bridge_bytes_ / 2);
     gw_.dequant_bytes = dense_bridge_bytes_;
@@ -317,7 +319,9 @@ QwenModel::MemoryPlan QwenModel::plan_memory(const QwenTextConfig& cfg, int max_
   }
   plan.add("gemm workspace (at least)", size_t{64} << 20);
   if (QwenLayerStream::dense_weights_fp8())
-    plan.add("dense fp8 prefill bridge (the largest dense matrix in BF16)",
+    plan.add(QwenLayerStream::dense_mlp_nvfp4()
+                 ? "dense prefill bridge (the largest dense matrix in BF16; the fp8 and nvfp4 forms share it)"
+                 : "dense fp8 prefill bridge (the largest dense matrix in BF16)",
              dense_bridge_bytes(cfg, QwenLocalGeometry::from_config(cfg, tp_rank, tp_world, head)));
   if (QwenLayerStream::dense_weights_fp8() && QwenLayerStream::prefill_fp8_gemm())
     plan.add("dense fp8 prefill activations (e4m3 rows + 1x128 scales; engine.prefill_fp8_gemm)",
@@ -496,6 +500,17 @@ size_t QwenModel::dense_bridge_bytes(const QwenTextConfig& cfg, const QwenLocalG
   take(W, r);                                                                            // GR up
   take(W, static_cast<size_t>(cfg.ple_embed_dim / std::max(geo.world, 1)));              // PLE key
   take(H, static_cast<size_t>(cfg.ple_embed_dim / std::max(geo.world, 1)));              // PLE value
+  // The dense MLP under the at-load NVFP4 form (docs/qwen38_dual_spark.md):
+  // its prefill has no scale-GEMM fallback — gemm_dense_fp4 dequantizes
+  // into this bridge or fails — so the bridge must hold the rank's slice.
+  // At world 2 the gate/up [I/2, H] and down [H, I/2] bound the list above
+  // (the real config: 8704 x 5120 = 85 MiB against q_proj's 60 MiB); under
+  // the plain fp8 form the MLP keeps the scale GEMM and stays out.
+  if (QwenLayerStream::dense_mlp_nvfp4()) {
+    const size_t I = static_cast<size_t>(std::max<int64_t>(geo.local_inter, 0));
+    take(I, H);
+    take(H, I);
+  }
   return elems * 2;
 }
 

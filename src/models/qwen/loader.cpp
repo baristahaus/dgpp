@@ -98,6 +98,9 @@ std::string& ngram_table_dir_storage() {
 }
 // The dense stack's form (engine.dense_weights = "fp8", 2026-09-10).
 bool g_dense_weights_fp8 = false;
+// The dense MLP's at-load NVFP4 form (engine.dense_weights = "nvfp4",
+// 2026-10-03, docs/qwen38_dual_spark.md).
+bool g_dense_mlp_nvfp4 = false;
 std::vector<int32_t> g_draft_vocab_ids;
 
 // A one-dimensional int32/int64 .npy (format 1.0 or 2.0, little-endian, C order).
@@ -730,14 +733,21 @@ struct QwenLoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
 
   // The dense form's SwiGLU MLP (the Qwen3.8-27B): gate/up by intermediate
   // rows, down by intermediate columns — the shared expert's shapes at the
-  // full width. The at-load FP8 encode follows engine.dense_weights like
-  // every other dense matrix (the BF16 release never ships pre-encoded).
+  // full width. The at-load encodes follow engine.dense_weights like every
+  // other dense matrix (the BF16 release never ships pre-encoded): "fp8"
+  // keeps the block-FP8 recipe; "nvfp4" takes the three to the modelopt
+  // NVFP4 triple (docs/qwen38_dual_spark.md) with the rest of the stack
+  // still FP8.
   void build_dense_mlp(const std::string& p) {
     QwenMlpResident& m = out.mlp;
     const int64_t I = geo.local_inter;
     const int64_t r = rank;
     m.local_inter = I;
-    if (g_dense_weights_fp8 && !cfg.dense_fp8_shipped) {
+    if (g_dense_mlp_nvfp4 && g_dense_weights_fp8 && !cfg.dense_fp8_shipped) {
+      m.fp4[0] = load_bf16_rows_fp4(p + "gate_proj.weight", r * I, I);
+      m.fp4[1] = load_bf16_rows_fp4(p + "up_proj.weight", r * I, I);
+      m.fp4[2] = load_bf16_cols_fp4(p + "down_proj.weight", r * I, I);
+    } else if (g_dense_weights_fp8 && !cfg.dense_fp8_shipped) {
       m.fp8[0] = load_bf16_rows_fp8(p + "gate_proj.weight", r * I, I);
       m.fp8[1] = load_bf16_rows_fp8(p + "up_proj.weight", r * I, I);
       m.fp8[2] = load_bf16_cols_fp8(p + "down_proj.weight", r * I, I);
@@ -1192,6 +1202,8 @@ bool QwenLayerStream::set_draft_vocab(const std::string& npy_path, std::string* 
 int QwenLayerStream::draft_vocab_count() { return static_cast<int>(g_draft_vocab_ids.size()); }
 const std::vector<int32_t>& QwenLayerStream::draft_vocab_ids() { return g_draft_vocab_ids; }
 bool QwenLayerStream::dense_weights_fp8() { return g_dense_weights_fp8; }
+void QwenLayerStream::set_dense_mlp_nvfp4(bool on) { g_dense_mlp_nvfp4 = on; }
+bool QwenLayerStream::dense_mlp_nvfp4() { return g_dense_mlp_nvfp4; }
 namespace {
 bool g_prefill_fp8_gemm = false;
 }
@@ -1203,9 +1215,11 @@ bool g_ngram_prestage = true;
 void QwenLayerStream::set_ngram_prestage(bool on) { g_ngram_prestage = on; }
 bool QwenLayerStream::ngram_prestage() { return g_ngram_prestage; }
 // Bit 8: the NVFP4 experts' activation scales live in the layer image (a
-// resident image written without them is rebuilt, not misread).
+// resident image written without them is rebuilt, not misread). Bit 16:
+// the dense MLP's at-load NVFP4 form (the same rule).
 uint64_t QwenLoaderFamily::loader_format() {
-  return (g_dense_weights_fp8 ? 2 : 1) | (g_mtp_experts_bf16_fused ? 4 : 0) | 8;
+  return (g_dense_weights_fp8 ? 2 : 1) | (g_mtp_experts_bf16_fused ? 4 : 0) | 8 |
+         (g_dense_mlp_nvfp4 ? 16 : 0);
 }
 
 void QwenLayerStream::set_mtp_expert_format(bool on) { g_mtp_experts_bf16_fused = on; }

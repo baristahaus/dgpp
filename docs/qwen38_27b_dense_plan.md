@@ -237,3 +237,10 @@ and traps found on the way, all resolved in-tree:
 
 P4/P5 remain: family entry, rxe transport, reference-dump dense variant and
 serving parity.
+
+2026-10-03, later: the §4 "not part of this port" NVFP4 MLP follow-up
+landed — `engine.dense_weights = "nvfp4"`, the at-load modelopt triple for
+all 65 dense SwiGLUs, 4.89 GB a rank at world 2 against fp8's 8.7
+(resident 14.0 → 10.25 GB, the KV/graph margin 2.3 → 5.3 GB). The fp4
+GEMV's fifth pass (K = 8704), the prefill bridge, the discrete memory
+plan and the traps: `docs/qwen38_dual_spark.md`.

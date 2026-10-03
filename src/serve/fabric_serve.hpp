@@ -122,7 +122,7 @@ struct WorldSettings {
   std::string kv_dtype = "bf16";  // the latent cache's format
   std::string ngram_table = "resident";  // the Qwen n-gram table's residency
   std::string fp8_head = "gemv";         // Qwen head: gemv | mma (opt-in)
-  std::string dense_weights = "checkpoint";  // the Qwen dense stack's form
+  std::string dense_weights = "checkpoint";  // the Qwen dense stack's form: checkpoint | fp8 | nvfp4
   std::string mtp_expert_format = "fp8";      // the Qwen MTP draft experts: fp8 | bf16_fused
   std::string bf16_weights = "checkpoint";   // the bf16 decode weights' resident form: checkpoint | bf12 | bf12+bf16
   std::string draft_vocab;                   // the Qwen draft head's vocabulary slice (.npy of ids); empty = whole

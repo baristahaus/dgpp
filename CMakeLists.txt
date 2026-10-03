@@ -168,6 +168,7 @@ add_library(dgpp_kernels STATIC
   src/kernels/kda.cu
   src/kernels/dsa.cu
   src/kernels/fp8_dequant.cu
+  src/kernels/fp4_dequant.cu
   src/kernels/fp8_gemm.cu
   src/kernels/fp4_gemv.cu
   src/kernels/packq_gemv.cu
@@ -560,6 +561,17 @@ add_test(NAME qwen_prefill_head_all_rows
           $<TARGET_FILE:qwen_decode_test> --fixture ${QWEN_FORWARD_FIXTURE} --prefill-head)
 set_tests_properties(qwen_prefill_head qwen_prefill_head_all_rows
   PROPERTIES DEPENDS qwen_forward_fixture LABELS "gpu" RUN_SERIAL TRUE)
+
+# The dense 27B's twin under the at-load NVFP4 MLP (engine.dense_weights =
+# "nvfp4", docs/qwen38_dual_spark.md): the fp4 GEMV's decode walks and the
+# 160-row prefill across the fp8 bridge's boundary.
+set(QWEN_DENSE_FORWARD_FIXTURE ${CMAKE_CURRENT_BINARY_DIR}/qwen_dense_forward_fixture)
+add_test(NAME qwen_dense_forward_fixture
+  COMMAND qwen_forward_test --write-fixture ${QWEN_DENSE_FORWARD_FIXTURE} --dense)
+add_test(NAME qwen_dense_mlp_fp4_decode
+  COMMAND qwen_decode_test --fixture ${QWEN_DENSE_FORWARD_FIXTURE} --dense-mlp-fp4)
+set_tests_properties(qwen_dense_mlp_fp4_decode
+  PROPERTIES DEPENDS qwen_dense_forward_fixture LABELS "gpu" RUN_SERIAL TRUE)
 
 add_executable(qwen_image_prefill_test tests/cuda/qwen_image_prefill_test.cpp)
 target_include_directories(qwen_image_prefill_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
@@ -1950,7 +1962,7 @@ set_tests_properties(tokenizer_test qwen_tokenizer_test glm4_tokenizer_test dsv4
   chat_template_test qwen_chat_template_test glm4_chat_template_test dsv41_prompt_test
   dsv4_tokenizer_test dsv4_prompt_test
   PROPERTIES LABELS "host;checkpoint")
-foreach(_test qwen_forward_fixture qwen_forward_generate glm4_forward_fixture
+foreach(_test qwen_forward_fixture qwen_forward_generate qwen_dense_forward_fixture glm4_forward_fixture
     glm4_forward_generate mimo_forward_fixture mimo_forward_generate mimo_forward_generate_teacher
     glm_forward_fixture glm_forward_generate dsa_dump_generate kda_dump_generate)
   set_tests_properties(${_test} PROPERTIES LABELS "fixture")

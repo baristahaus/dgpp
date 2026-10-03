@@ -220,6 +220,13 @@ struct PinnedWords {
 // fabric rather than erroring, so the head node must not run builds beside
 // a serving world at this margin.
 constexpr size_t kMemoryHeadroomBytes = size_t{4} << 30;
+// A discrete GPU's own margin: the CUDA context (~0.25 GiB on the 610
+// driver), the graph pools the capture allocates beside the plan's
+// activation workspace, and allocator growth. The 4 GiB unified constant
+// is a host-side residual measurement; on a 16 GiB card it would eat a
+// quarter of the pool, so the device gets this smaller one. Revisit with
+// the resident soak's ledger on new hardware.
+constexpr size_t kDeviceHeadroomBytes = size_t{1} << 30;
 
 std::string gib(double bytes) {
   return std::format("{:.2f} GiB", bytes / (1024.0 * 1024.0 * 1024.0));
@@ -893,8 +900,43 @@ void check_memory_plan(
   size_t free_bytes = 0, total_bytes = 0;
   DGPP_CUDA_OK(cudaMemGetInfo(&free_bytes, &total_bytes));
   const size_t available = dgpp::host_memory_available_bytes();
-  const size_t budget = std::max(free_bytes, available);
   const size_t need = plan.total_bytes() + prefix_arena_bytes + engine_bytes;
+  cudaDeviceProp prop{};
+  {
+    int dev = -1;
+    DGPP_CUDA_OK(cudaGetDevice(&dev));
+    DGPP_CUDA_OK(cudaGetDeviceProperties(&prop, dev));
+  }
+  // GB10's unified memory makes the device and host readings two views of
+  // one physical pool: the sum against the larger view is the check. A
+  // discrete GPU (this node's 5070 Ti ranks) has two pools with nothing
+  // shared between them — each side is checked against its own reading,
+  // and the headrooms differ (kDeviceHeadroomBytes above).
+  const size_t host_headroom = kMemoryHeadroomBytes;
+  size_t budget;   // the binding pool, for the hint and the error
+  size_t binding;  // the need measured against it
+  size_t headroom;
+  bool dev_side_fits, host_side_fits;
+  if (prop.integrated) {
+    budget = std::max(free_bytes, available);
+    binding = need;
+    headroom = host_headroom;
+    dev_side_fits = host_side_fits = need + headroom <= budget;
+  } else {
+    const size_t dev_need = plan.device_bytes();
+    const size_t host_need = plan.pinned_bytes() + prefix_arena_bytes + engine_bytes;
+    budget = free_bytes;
+    headroom = kDeviceHeadroomBytes;
+    dev_side_fits = dev_need + kDeviceHeadroomBytes <= free_bytes;
+    host_side_fits = host_need + host_headroom <= available;
+    if (!dev_side_fits) {
+      binding = dev_need;
+    } else {
+      budget = available;
+      binding = host_need;
+      headroom = host_headroom;
+    }
+  }
   std::string items;
   for (const auto& it : plan.items) {
     if (it.device + it.pinned < (size_t{1} << 20)) continue;
@@ -907,26 +949,41 @@ void check_memory_plan(
                 gib(static_cast<double>(engine_bytes)));
   DGPP_LOG_INFO(
       "rank {}: memory plan total {} ({} device + {} pinned) + {} headroom against {} free "
-      "(device free {} of {}, host available {})",
+      "(device free {} of {}, host available {}{})",
       rank, gib(static_cast<double>(need)), gib(static_cast<double>(plan.device_bytes())),
       gib(static_cast<double>(plan.pinned_bytes() + prefix_arena_bytes + engine_bytes)),
-      gib(static_cast<double>(kMemoryHeadroomBytes)), gib(static_cast<double>(budget)),
+      gib(static_cast<double>(headroom)), gib(static_cast<double>(budget)),
       gib(static_cast<double>(free_bytes)), gib(static_cast<double>(total_bytes)),
-      gib(static_cast<double>(available)));
-  if (need + kMemoryHeadroomBytes <= budget) return;
+      gib(static_cast<double>(available)),
+      prop.integrated ? "" :
+          std::format("; discrete: device {} {} of {} free — {}; host {} {} of {} — {}",
+                      dev_side_fits ? "fits" : "over", gib(static_cast<double>(plan.device_bytes())),
+                      gib(static_cast<double>(free_bytes)),
+                      std::string(dev_side_fits ? "" : "BINDING"),
+                      host_side_fits ? "fits" : "over", gib(static_cast<double>(plan.pinned_bytes())),
+                      gib(static_cast<double>(available)),
+                      std::string(dev_side_fits ? "BINDING" : "")));
+  if (dev_side_fits && host_side_fits) return;
   // The plan is affine in the context: its slope from two points names the
   // largest context this node could hold with everything else as configured.
   std::string hint;
   if (plan.context_tokens > block_tokens) {
     const dgpp::MemoryPlan below = plan_at(plan.context_tokens - block_tokens);
+    const auto side_bytes = [&](const dgpp::MemoryPlan& p) {
+      return prop.integrated ? p.total_bytes()
+                             : (dev_side_fits ? p.pinned_bytes() : p.device_bytes());
+    };
     const double per_token =
-        static_cast<double>(plan.total_bytes()) - static_cast<double>(below.total_bytes());
+        static_cast<double>(side_bytes(plan)) - static_cast<double>(side_bytes(below));
     if (per_token > 0) {
       const double per = per_token / static_cast<double>(block_tokens);
-      const double fixed = static_cast<double>(plan.total_bytes()) -
+      const double fixed = static_cast<double>(side_bytes(plan)) -
                            per * static_cast<double>(plan.context_tokens) +
-                           static_cast<double>(prefix_arena_bytes + engine_bytes +
-                                               kMemoryHeadroomBytes);
+                           static_cast<double>(headroom) +
+                           // The arena and the engine buffers live in the
+                           // unified or the host pool — never the device's.
+                           static_cast<double>(prop.integrated || dev_side_fits
+                                                   ? prefix_arena_bytes + engine_bytes : 0);
       const double room = static_cast<double>(budget) - fixed;
       const int64_t feasible =
           room > 0 ? static_cast<int64_t>(room / per) / block_tokens * block_tokens : 0;
@@ -950,7 +1007,7 @@ void check_memory_plan(
       "refusing to allocate (the largest items: {}).{} Lower engine.kv_capacity, "
       "engine.max_concurrency or engine.prefix_cache_gib, or choose a smaller "
       "engine.kv_dtype.",
-      rank, gib(static_cast<double>(need)), gib(static_cast<double>(kMemoryHeadroomBytes)),
+      rank, gib(static_cast<double>(binding)), gib(static_cast<double>(headroom)),
       gib(static_cast<double>(budget)), top, hint));
 }
 
@@ -1337,7 +1394,7 @@ int main(int argc, char** argv) {
   std::string ngram_table = "resident";  // the Qwen n-gram table: resident | mmap
   std::string ngram_table_model;         // the table's shards from another cached snapshot (engine.ngram_table_model)
   std::string fp8_head = "gemv";
-  std::string dense_weights = "checkpoint";  // the Qwen dense stack: checkpoint | fp8
+  std::string dense_weights = "checkpoint";  // the Qwen dense stack: checkpoint | fp8 | nvfp4
   std::string mtp_expert_format = "fp8";    // the Qwen MTP draft experts: fp8 | bf16_fused
   std::string bf16_weights = "checkpoint";  // the bf16 decode weights' resident form: checkpoint | bf12 | bf12+bf16
   std::string draft_vocab;                  // the Qwen draft head's vocabulary slice (engine.draft_vocab)
@@ -1892,12 +1949,12 @@ int main(int argc, char** argv) {
     DGPP_LOG_ERROR("engine.fp8_head (--fp8-head) must be gemv or mma, got '{}'", fp8_head);
     return 1;
   }
-  if (dense_weights != "checkpoint" && dense_weights != "fp8") {
-    DGPP_LOG_ERROR("--dense-weights must be checkpoint or fp8, got '{}'", dense_weights);
+  if (dense_weights != "checkpoint" && dense_weights != "fp8" && dense_weights != "nvfp4") {
+    DGPP_LOG_ERROR("--dense-weights must be checkpoint, fp8 or nvfp4, got '{}'", dense_weights);
     return 2;
   }
-  if (fp8_head == "mma" && dense_weights != "fp8") {
-    DGPP_LOG_ERROR("engine.fp8_head mma requires engine.dense_weights fp8");
+  if (fp8_head == "mma" && dense_weights == "checkpoint") {
+    DGPP_LOG_ERROR("engine.fp8_head mma requires engine.dense_weights fp8 or nvfp4");
     return 1;
   }
   dgpp::Bf16Residency bf16_mode = dgpp::Bf16Residency::Checkpoint;
@@ -1919,11 +1976,16 @@ int main(int argc, char** argv) {
   }
   // The DeepSeek-V4.1 prefill mode: every model built from here on takes it.
   dgpp::Dsv41Model::set_default_prefill_bounded(prefill == "bounded");
-  dgpp::QwenLayerStream::set_dense_weights_fp8(dense_weights == "fp8");
+  // The dense stack's form. "fp8": every dense projection to block FP8 at
+  // load. "nvfp4" (2026-10-03, docs/qwen38_dual_spark.md): the fp8 stack's
+  // MLPs — the dense 27B's biggest matrices — further encoded to the
+  // modelopt NVFP4 triple; it implies the fp8 form for the rest.
+  dgpp::QwenLayerStream::set_dense_weights_fp8(dense_weights == "fp8" || dense_weights == "nvfp4");
+  dgpp::QwenLayerStream::set_dense_mlp_nvfp4(dense_weights == "nvfp4");
   // The opt-in prefill levers (2026-09-30): each default off, never
   // bitwise the default chain; a deployment turns one on in its config.
-  if (prefill_fp8_gemm && dense_weights != "fp8") {
-    DGPP_LOG_ERROR("engine.prefill_fp8_gemm requires engine.dense_weights fp8");
+  if (prefill_fp8_gemm && dense_weights == "checkpoint") {
+    DGPP_LOG_ERROR("engine.prefill_fp8_gemm requires engine.dense_weights fp8 or nvfp4");
     return 2;
   }
   // The packed expert GEMM's form and companions (engine.expert_*,
@@ -2195,7 +2257,8 @@ int main(int argc, char** argv) {
     if (std::string(family->name()) != "qwen4_exp" && ngram_table != "resident")
       DGPP_LOG_WARN("serve: --ngram-table {} applies to the Qwen n-gram table only; the {} family has none",
                     ngram_table, family->name());
-    if (std::string(family->name()) != "qwen4_exp" && dense_weights != "checkpoint")
+    if (std::string(family->name()) != "qwen4_exp" && std::string(family->name()) != "qwen3_5" &&
+        dense_weights != "checkpoint")
       DGPP_LOG_WARN("serve: --dense-weights {} applies to the Qwen dense stack only; the {} family loads as shipped",
                     dense_weights, family->name());
     if (std::string(family->name()) != "qwen4_exp" && mtp_expert_format != "fp8")

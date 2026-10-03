@@ -551,6 +551,141 @@ DGPP_TEST(qwen_loader_dense_fp8_at_load_is_the_reference_recipe) {
   require(g.bytes == QwenLayerStream::globals_bytes(fx.cfg, 0, 1, dgpp::QwenHeadSharding::Full), "globals formula (fp8)");
 }
 
+// The NVFP4 recipe, reimplemented from loaders/nvfp4_quant.hpp's comment
+// the way reference_fp8 reimplements the FP8 one: the oracle for the
+// at-load encode's wiring (slices, strides, nibble order, global).
+std::vector<uint16_t> to_u16(const std::vector<uint8_t>& b) {
+  std::vector<uint16_t> h(b.size() / 2);
+  std::memcpy(h.data(), b.data(), b.size());
+  return h;
+}
+
+void reference_nvfp4(const std::vector<uint16_t>& w, int64_t rows, int64_t cols,
+                     std::vector<uint8_t>* payload, std::vector<uint8_t>* scales, float* global) {
+  float amax = 0.f;
+  for (size_t i = 0; i < w.size(); ++i) amax = std::max(amax, std::fabs(dgpp::bf16_bits_to_float(w[i])));
+  const float ws2 = amax > 0.f && std::isfinite(amax) ? amax / (6.f * 448.f) : 1.f;
+  *global = 1.0f / ws2;
+  payload->assign(static_cast<size_t>(rows) * cols / 2, 0);
+  scales->assign(static_cast<size_t>(rows) * cols / 16, 0);
+  for (int64_t r = 0; r < rows; ++r)
+    for (int64_t b = 0; b < cols / 16; ++b) {
+      float bmax = 0.f;
+      for (int j = 0; j < 16; ++j)
+        bmax = std::max(bmax, std::fabs(dgpp::bf16_bits_to_float(w[static_cast<size_t>(r) * cols + b * 16 + j])));
+      const uint8_t sc = dgpp::float_to_fp8_e4m3_bits(bmax / 6.f / ws2);
+      (*scales)[static_cast<size_t>(r) * (cols / 16) + b] = sc;
+      const float S = dgpp::fp8_e4m3_bits_to_float(sc) * ws2;
+      const float inv = S > 0.f ? 1.f / S : 0.f;
+      for (int j = 0; j < 16; j += 2) {
+        const int64_t e = b * 16 + j;
+        const float lo = dgpp::bf16_bits_to_float(w[static_cast<size_t>(r) * cols + e]) * inv;
+        const float hi = dgpp::bf16_bits_to_float(w[static_cast<size_t>(r) * cols + e + 1]) * inv;
+        (*payload)[static_cast<size_t>(r) * (cols / 2) + e / 2] =
+            static_cast<uint8_t>(dgpp::float_to_fp4_e2m1_bits(lo) | (dgpp::float_to_fp4_e2m1_bits(hi) << 4));
+      }
+    }
+}
+
+void expect_fp4_matches(const dgpp::GlmFp4Matrix& q, const std::vector<uint16_t>& w, const std::string& what) {
+  std::vector<uint8_t> payload, scales;
+  float global = 0.f;
+  reference_nvfp4(w, q.rows, q.cols, &payload, &scales, &global);
+  const std::vector<uint8_t> got_payload = device_bytes(q.payload, payload.size());
+  require(got_payload == payload, what + ": the e2m1 payload differs from the reference recipe");
+  const std::vector<uint8_t> got_scales = device_bytes(q.scales, scales.size());
+  require(got_scales == scales, what + ": the e4m3 block scales differ from the reference recipe");
+  float dev_global = 0.f;
+  {
+    const auto b = device_bytes(q.global_scale, 4);
+    std::memcpy(&dev_global, b.data(), 4);
+  }
+  require(dev_global == global, what + ": the device global differs from 1 / weight_scale_2");
+  // Decoded back: within the e2m1 grid's half step (<= 1 x S_b — the codes
+  // were chosen against the exact scale, so the only error is the grid's).
+  for (int64_t r = 0; r < q.rows; ++r)
+    for (int64_t c = 0; c < q.cols; ++c) {
+      const float dq = dgpp::nvfp4_decode(got_payload.data(), got_scales.data(), dev_global, q.cols, r, c);
+      const float x = dgpp::bf16_bits_to_float(w[static_cast<size_t>(r) * q.cols + c]);
+      const uint8_t sc = got_scales[static_cast<size_t>(r) * (q.cols / 16) + c / 16];
+      const float S = dgpp::fp8_e4m3_bits_to_float(sc) / dev_global;
+      require(std::fabs(dq - x) <= S + 1e-30f,
+              what + ": decoded value outside the e2m1 half step at (" + std::to_string(r) + ", " +
+                  std::to_string(c) + ")");
+    }
+}
+
+DGPP_TEST(qwen_loader_dense_mlp_nvfp4_at_load_is_the_recipe) {
+  // The dense twin (docs/qwen38_27b_dense_plan.md): the form the at-load
+  // NVFP4 MLP targets (engine.dense_weights = "nvfp4",
+  // docs/qwen38_dual_spark.md).
+  Fixture fx;
+  fx.cfg = qwenfx::tiny_dense_config();
+  fx.dir = (fs::current_path() / "qwen_loader_nvfp4_fixture").string();
+  qwenfx::write_fixture_for(fx.cfg, fx.dir);
+  fx.table = dgpp::qwen_expected_text_tensors(fx.cfg);
+  const std::string p = dgpp::qwen_layer_prefix(fx.cfg, 0);
+  const int64_t H = fx.cfg.hidden_size, I = fx.cfg.intermediate_size;
+  require(!QwenLayerStream::dense_weights_fp8() && !QwenLayerStream::dense_mlp_nvfp4(),
+          "both knobs are off by default");
+  const size_t bytes_bf16 = QwenLayerStream::layer_bytes(fx.cfg, 0, 0, 1);
+  QwenLayerStream::set_dense_weights_fp8(true);
+  const size_t bytes_fp8 = QwenLayerStream::layer_bytes(fx.cfg, 0, 0, 1);
+  QwenLayerStream::set_dense_mlp_nvfp4(true);
+  struct Reset {
+    ~Reset() {
+      QwenLayerStream::set_dense_mlp_nvfp4(false);
+      QwenLayerStream::set_dense_weights_fp8(false);
+    }
+  } reset;
+  const size_t bytes_nvfp4 = QwenLayerStream::layer_bytes(fx.cfg, 0, 0, 1);
+  require(bytes_fp8 < bytes_bf16, "the FP8 layer is smaller in the plan");
+  require(bytes_nvfp4 < bytes_fp8, "the NVFP4 MLP is smaller than the FP8 one in the plan");
+
+  // World 1: the whole matrices.
+  {
+    QwenLayerStream s(fx.cfg, fx.dir, 0, 1, dgpp::QwenResidency::Streaming, dgpp::QwenHeadSharding::Full,
+                      /*resident_mtp=*/true);
+    const auto& l = s.load_layer(0);
+    require(l.mlp.gate == nullptr && l.mlp.up == nullptr && l.mlp.down == nullptr,
+            "the dense MLP sites are fp4");
+    require(l.mlp.fp4[0].rows == I && l.mlp.fp4[0].cols == H, "gate's shape");
+    expect_fp4_matches(l.mlp.fp4[0], to_u16(fx.bytes(p + "mlp.gate_proj.weight")), "gate (world 1)");
+    expect_fp4_matches(l.mlp.fp4[1], to_u16(fx.bytes(p + "mlp.up_proj.weight")), "up (world 1)");
+    expect_fp4_matches(l.mlp.fp4[2], to_u16(fx.bytes(p + "mlp.down_proj.weight")), "down (world 1)");
+    require(s.source_bytes_read() == QwenLayerStream::planned_layer_source_bytes(fx.cfg, 0, 0, 1),
+            "nvfp4 world 1: the source-byte plan equals the bytes read");
+    s.release_layer();
+    // The MTP draft layer's dense MLP takes the same form.
+    const auto& m = s.load_layer(fx.cfg.num_hidden_layers);
+    require(m.mlp.fp4[0].payload != nullptr && m.mlp.fp8[0].payload == nullptr,
+            "the MTP draft layer's MLP is fp4 too");
+    expect_fp4_matches(m.mlp.fp4[0], to_u16(fx.bytes(dgpp::qwen_layer_prefix(fx.cfg, fx.cfg.num_hidden_layers) +
+                                                     "mlp.gate_proj.weight")),
+                       "mtp gate (world 1)");
+    s.release_layer();
+  }
+
+  // World 2, rank 1: gate/up by rows, down by columns — the fp8 test's
+  // slicing recipe (host_cols's c0/w are bytes: rank * local * 2, local * 2).
+  {
+    QwenLayerStream s(fx.cfg, fx.dir, 1, 2, dgpp::QwenResidency::Streaming, dgpp::QwenHeadSharding::Full,
+                      /*resident_mtp=*/true);
+    const auto& l = s.load_layer(0);
+    require(l.mlp.fp4[0].rows == I / 2 && l.mlp.fp4[0].cols == H, "gate's sliced shape");
+    expect_fp4_matches(l.mlp.fp4[0], to_u16(host_rows(fx.bytes(p + "mlp.gate_proj.weight"), H * 2, I / 2, I / 2)),
+                       "gate (world 2 rank 1)");
+    expect_fp4_matches(l.mlp.fp4[1], to_u16(host_rows(fx.bytes(p + "mlp.up_proj.weight"), H * 2, I / 2, I / 2)),
+                       "up (world 2 rank 1)");
+    expect_fp4_matches(l.mlp.fp4[2],
+                       to_u16(host_cols(fx.bytes(p + "mlp.down_proj.weight"), H, I * 2, I, I)),
+                       "down (world 2 rank 1)");
+    require(s.source_bytes_read() == QwenLayerStream::planned_layer_source_bytes(fx.cfg, 0, 1, 2),
+            "nvfp4 sliced: the source-byte plan equals the bytes read");
+    s.release_layer();
+  }
+}
+
 DGPP_TEST(qwen_loader_mmap_ngram_table_reads_the_shards_rows) {
   const Fixture fx = write_fixture();
   const dgpp::QwenNgramGeometry ng = fx.cfg.ngram_geometry();

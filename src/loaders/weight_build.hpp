@@ -29,7 +29,9 @@
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
 #include "kernels/bf12_gemv.hpp"
+#include "kernels/latent_format.hpp"
 #include "loaders/fp8_quant.hpp"
+#include "loaders/nvfp4_quant.hpp"
 #include "loaders/releasable_range.hpp"
 #include "loaders/safetensors.hpp"
 #include "models/quant_matrix.hpp"
@@ -523,6 +525,69 @@ struct WeightBuilder {
     const Expected& e = expected(name);
     if (e.shape.size() != 2) fail("'" + name + "' is not a matrix");
     return load_bf16_rows_fp8(name, 0, e.shape[0]);
+  }
+
+  // ---- BF16 matrices encoded to NVFP4 at load -----------------
+  // The engine.dense_weights = "nvfp4" MLP form (docs/qwen38_dual_spark.md):
+  // a BF16 rows / columns slice encoded on the host into the modelopt
+  // triple — e2m1 pairs, one e4m3 block scale per 16 elements, the recipe's
+  // fp32 global as 1 / weight_scale_2 on the device (loaders/nvfp4_quant.hpp,
+  // the same encoder the GLM-4.7 requant path uses). The scale grid is
+  // anchored at the slice's origin: a K slice starts on a 16-element block
+  // boundary by construction (the TP slice widths are multiples of it).
+  GlmFp4Matrix encode_fp4(const uint16_t* host_src, size_t src_stride, int64_t rows,
+                          int64_t cols) {
+    fp4_check_cols(cols, "the at-load NVFP4 encode");
+    const size_t pc = static_cast<size_t>(cols / 2), sc = static_cast<size_t>(cols / kLatentFp4Block);
+    GlmFp4Matrix q;
+    q.rows = rows;
+    q.cols = cols;
+    q.payload = static_cast<const uint8_t*>(bump.alloc(static_cast<size_t>(rows) * pc));
+    q.scales = static_cast<const uint8_t*>(bump.alloc(static_cast<size_t>(rows) * sc));
+    q.global_scale = static_cast<const float*>(bump.alloc(4));
+    float ws2 = 1.0f;
+    if (copy) {
+      float amax = 0.0f;
+      for (int64_t r = 0; r < rows; ++r)
+        amax = std::max(amax, nvfp4_amax_bf16(host_src + static_cast<size_t>(r) * src_stride, cols));
+      ws2 = nvfp4_tensor_scale(amax);
+      *bump.host(const_cast<float*>(q.global_scale)) = 1.0f / ws2;
+      std::vector<float> row(static_cast<size_t>(cols));
+      uint8_t* hp = bump.host(const_cast<uint8_t*>(q.payload));
+      uint8_t* hs = bump.host(const_cast<uint8_t*>(q.scales));
+      for (int64_t r = 0; r < rows; ++r) {
+        const uint16_t* s = host_src + static_cast<size_t>(r) * src_stride;
+        for (int64_t c = 0; c < cols; ++c) row[static_cast<size_t>(c)] = bf16_bits_to_float(s[c]);
+        nvfp4_encode_row(row.data(), cols, ws2, hp + r * pc, hs + r * sc);
+      }
+    }
+    return q;
+  }
+  GlmFp4Matrix load_bf16_rows_fp4(const std::string& name, int64_t row_start, int64_t rows) {
+    const Expected& e = expected(name);
+    check_range(name, row_start, rows, e.shape[0]);
+    const int64_t width = static_cast<int64_t>(e.numel()) / e.shape[0];
+    const uint16_t* src = nullptr;
+    if (copy) {
+      const TensorInfo& t = source(name);
+      src = static_cast<const uint16_t*>(t.data) + static_cast<size_t>(row_start) * width;
+    }
+    GlmFp4Matrix q = encode_fp4(src, static_cast<size_t>(width), rows, width);
+    if (copy) consumed(source(name));
+    note_read(e, static_cast<size_t>(rows) * width * 2);
+    return q;
+  }
+  GlmFp4Matrix load_bf16_cols_fp4(const std::string& name, int64_t col_start, int64_t cols) {
+    const Expected& e = expected(name);
+    if (e.shape.size() != 2) fail("'" + name + "' is not a matrix");
+    const int64_t rows = e.shape[0], full = e.shape[1];
+    check_range(name, col_start, cols, full);
+    const uint16_t* src = nullptr;
+    if (copy) src = static_cast<const uint16_t*>(source(name).data) + col_start;
+    GlmFp4Matrix q = encode_fp4(src, static_cast<size_t>(full), rows, cols);
+    if (copy) consumed(source(name));
+    note_read(e, static_cast<size_t>(rows) * static_cast<size_t>(cols) * 2);
+    return q;
   }
 
   float* load_f32_range(const std::string& name, int64_t start, int64_t count) {
