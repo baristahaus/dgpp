@@ -5,8 +5,12 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Target GB10's architecture-specific instructions, including the
 # e2m1x2 -> f16x2 conversion used by the FP4 kernels. These binaries
-# require compute capability 12.1.
-set(CMAKE_CUDA_ARCHITECTURES 121a)
+# require compute capability 12.x; the default is the GB10's 12.1, and a
+# node with consumer Blackwell (RTX 5070 Ti, sm_120a) overrides it with
+# -DCMAKE_CUDA_ARCHITECTURES=120a (docs/qwen38_27b_dense_plan.md §4).
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES 121a)
+endif()
 # SSH login shells may omit CUDA from PATH. Respect explicit compiler choices,
 # including toolchains, before looking for the conventional DGX OS installation.
 if(NOT DEFINED CMAKE_CUDA_COMPILER AND "$ENV{CUDACXX}" STREQUAL "")

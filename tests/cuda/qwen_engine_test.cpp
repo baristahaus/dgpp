@@ -1142,6 +1142,12 @@ DGPP_TEST(qwen_mtp_existing_hidden_projection_keeps_dispatch) {
   };
   for (const bool decode : {false, true}) {
     for (const int tokens : {2, 4, 6, 8, 12, 16}) {
+      // A cold heuristic query during capture invalidates the capture on
+      // driver 610 + cuBLASLt 13.3 (sm_120; GB10 tolerated cold queries).
+      // The engine's eager pass warms every plan before it captures; the
+      // capture arms here do the same through the same hook.
+      require(gemm.ensure_plan(tokens * hc, H, H, dgpp::DType::BF16, dgpp::GemmOut::BF16, H),
+              "cublasLt plan warmup for the MTP hidden projection");
       const auto baseline = capture(tokens, decode, false);
       const auto configured = capture(tokens, decode, true);
       require(
@@ -1221,6 +1227,11 @@ DGPP_TEST(qwen_wide_bf16_dense_real_shards_are_kernel_only) {
   const auto stream = test_stream();
   const auto capture = [&](int rows, int cols, bool guarded, bool check_nodes) {
     gemm.set_kernel_only_rows(guarded ? 17 : 0, guarded ? 64 : 0);
+    // Cold heuristic queries are not capture-safe on every platform
+    // (driver 610 + cuBLASLt 13.3 invalidates the capture, sm_120); warm
+    // the plan as the engine's eager pass does before capturing.
+    require(gemm.ensure_plan(rows, cols, H, dgpp::DType::BF16, dgpp::GemmOut::BF16, H),
+            "cublasLt plan warmup for the wide BF16 dense shard");
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t executable = nullptr;
     DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));

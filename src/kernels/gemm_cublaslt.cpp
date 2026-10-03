@@ -330,6 +330,13 @@ struct CublasLtGemm::Impl {
 
     cublasLtMatmulHeuristicResult_t heur{};
     int nres = 0;
+    // A heuristic query is not capture-safe on every platform: driver 610 +
+    // cuBLASLt 13.3 on sm_120 invalidates a capture that queries it (status
+    // NOT_SUPPORTED, cudaErrorStreamCaptureUnsupported), where GB10's stack
+    // answered cold queries mid-capture. Plans must therefore exist before
+    // capture: the engine's eager pass warms them, and any capture-only
+    // caller goes through ensure_plan() first (qwen_engine_test's MTP
+    // projection and dense-shard arms).
     cublasStatus_t st =
         cublasLtMatmulAlgoGetHeuristic(lt, p.desc, p.la, p.lb, p.ld, p.ld, pref, 1, &heur, &nres);
     cublasLtMatmulPreferenceDestroy(pref);
