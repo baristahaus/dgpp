@@ -1,0 +1,27 @@
+{
+  "model": "Qwen/Qwen3.8-27B-NVFP4-MoE-NVFP4-Mix",
+  "world_size": 1,
+  "engine": {
+    "max_concurrency": 2,
+    "kv_capacity": 16384,
+    "kv_dtype": "bf16",
+    "default_max_tokens": 1024,
+    "queue_limit": 8,
+    "max_connections": 32,
+    "decode_graph": false,
+    "mtp": false,
+    "prefix_cache_gib": 0.3,
+    "admission": "grow",
+    "admission_window": 256,
+    "model_alias": "qwen3.8-27b",
+    "sampling_candidates": 128,
+    "stats_interval_s": 10
+  },
+  "paths": {
+    "resident_cache": ""
+  },
+  "http": {
+    "bind_host": "127.0.0.1",
+    "port": 18080
+  }
+}

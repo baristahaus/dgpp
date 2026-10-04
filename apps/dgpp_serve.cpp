@@ -908,9 +908,11 @@ struct Qwen35Family final : ServeFamily {
   }
   dgpp::MemoryPlan plan(int forward_rows, int64_t context, int rank, int world_, bool fabric, int slots,
                         bool mtp, int decode_rows) const override {
+    // The draft (MTP) is not a fabric-only feature: the world-1 graph engine
+    // speculates with it too, so the plan counts it whenever it is on.
     return dgpp::Qwen35Model::plan_memory(cfg, forward_rows, context, fabric ? rank : 0, fabric ? world_ : 1,
                                           fabric || !dflash.empty() ? dgpp::LoaderResidency::Resident : dgpp::LoaderResidency::Streaming,
-                                          slots, fabric && mtp, decode_rows, dflash);
+                                          slots, mtp, decode_rows, dflash);
   }
   size_t snapshot_bytes(int world_, bool mtp) const override {
     return dgpp::Qwen35Model::session_snapshot_bytes(cfg, world_, mtp);
@@ -924,7 +926,7 @@ struct Qwen35Family final : ServeFamily {
         cfg, ckpt, forward_rows, pool_tokens,
         fabric || !dflash.empty() ? dgpp::LoaderResidency::Resident : dgpp::LoaderResidency::Streaming,
         reducer, fabric ? rank : 0,
-        fabric ? world_ : 1, slots, decode_rows, fabric && mtp, dflash);
+        fabric ? world_ : 1, slots, decode_rows, mtp, dflash);
   }
   void set_draft_model(const std::string& dir) override { dflash = dir; }
   void destroy_model() override { model.reset(); }
@@ -2574,7 +2576,13 @@ int main(int argc, char** argv) {
     if (memory_plan_only) {
       // The check alone, for the shape this rank would run (world > 1: the
       // resident, vocab-sharded fabric model; world 1: the streaming one).
-      const bool fabric = graph_world;
+      // Fabric means the RDMA world (world > 1). graph_world is the CUDA
+      // GRAPH knob (true at world 1 whenever decode_graph is on), and the
+      // family's plan keys residency and head sharding off this flag —
+      // passing the graph flag planned the resident, vocab-sharded image
+      // for a single streaming card and the doctor refused a shape that
+      // fits. The world-1 run is the streaming one.
+      const bool fabric = world > 1;
       const auto plan_at = [&](int64_t context) {
         return family->plan(static_cast<int>(std::min<int64_t>(context, forward_rows)), context, rank,
                             world, fabric, max_concurrency, mtp, decode_rows);
@@ -2712,8 +2720,10 @@ int main(int argc, char** argv) {
         dgpp::prepare_serving_process(rank);
         {
           const auto plan_at = [&](int64_t context) {
+            // Fabric means the RDMA world: at world 1 this is the streaming
+            // local run, and the family's plan keys residency off the flag.
             return family->plan(static_cast<int>(std::min<int64_t>(context, forward_rows)), context,
-                                rank, world, /*fabric=*/true, max_concurrency, mtp, decode_rows);
+                                rank, world, /*fabric=*/world > 1, max_concurrency, mtp, decode_rows);
           };
           check_memory_plan(rank, plan_at(pool_tokens), prefix_arena_bytes, engine_bytes,
                             block_tokens, plan_at);
@@ -2721,7 +2731,13 @@ int main(int argc, char** argv) {
         }
         const auto t_model = std::chrono::steady_clock::now();
         dgpp::log_memory_ledger(std::format("rank {} after the bus", rank));
-        family->build_model(model_reducer, rank, world, /*fabric=*/true, forward_rows, pool_tokens,
+        // Fabric means the RDMA world. graph_world is the CUDA-GRAPH knob
+        // (true whenever decode_graph is on, at any world), and the family
+        // keys residency and head sharding off this flag — passing the
+        // graph flag asked a single card for the resident, vocab-sharded
+        // image and the boot died mid-warmup. The world-1 graph run is the
+        // streaming local one.
+        family->build_model(model_reducer, rank, world, /*fabric=*/world > 1, forward_rows, pool_tokens,
                             max_concurrency, mtp, decode_rows);
         dgpp::log_memory_ledger(std::format("rank {} after the model", rank));
         DGPP_LOG_INFO(
@@ -2942,8 +2958,12 @@ int main(int argc, char** argv) {
                         block_tokens, plan_at);
     }
     const auto t_model = std::chrono::steady_clock::now();
+    // The local world-1 run takes the draft too (the graph engine's spec
+    // path is the same one the fabric uses; the snapshot sizing above
+    // already counted it): MTP needs the decode-graph engine, which is
+    // what graph_world says.
     family->build_model(/*reducer=*/nullptr, /*rank=*/0, /*world=*/1, /*fabric=*/false, forward_rows,
-                        pool_tokens, max_concurrency, /*mtp=*/false, decode_rows);
+                        pool_tokens, max_concurrency, /*mtp=*/mtp && graph_world, decode_rows);
     DGPP_LOG_INFO(
         "serve: model constructed in {:.1f}s (streaming, {} request slots, "
         "{}-token pool in {}, {}-row forwards)",

@@ -1034,8 +1034,15 @@ MemoryPlan Qwen35Model::plan_memory(const Qwen35TextConfig& cfg, int max_tokens,
     size_t largest = 0;
     for (int l = 0; l < cfg.num_hidden_layers; ++l)
       largest = std::max(largest, Qwen35LayerStream::layer_bytes(cfg, l, rank, world));
+    // Device side: the globals bump plus ONE layer bump (the stream's own
+    // device bump is the largest layer, the host staging is the max of the
+    // two and is pinned host memory, accounted as pinned below).
     plan.add("model weights (one streamed layer + globals)",
              largest + Qwen35LayerStream::globals_bytes(cfg, rank, world, head));
+    // The host staging the stream rewrites every layer, pinned: as large as
+    // the biggest of a layer, the globals, or the family's floor.
+    plan.add("loader staging (pinned host, the stream's rewrite buffer)", 0,
+             Qwen35LayerStream::staging_plan_bytes(cfg, rank, world, head, mtp));
   }
   Qwen35KvPoolShape shape;
   shape.layers = 0;
