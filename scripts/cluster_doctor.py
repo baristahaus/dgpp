@@ -197,11 +197,31 @@ def probe(spec):
         checks.append({"check": name, "status": status, "detail": detail})
     env = dict(os.environ)
     env.update({key: os.path.expanduser(value) for key, value in spec["env"].items()})
-    record("platform", "ok" if platform.system() == "Linux" and platform.machine() == "aarch64" else "fail",
-           f"{platform.system()} {platform.machine()}; supported target is Linux/aarch64 GB10")
+    # The engine's two targets: GB10 (aarch64) and the discrete-Blackwell
+    # x86_64 nodes (the 5070 Ti class).
+    supported = platform.system() == "Linux" and platform.machine() in ("aarch64", "x86_64")
+    record("platform", "ok" if supported else "fail",
+           f"{platform.system()} {platform.machine()}; supported targets are Linux/aarch64 GB10 and Linux/x86_64 Blackwell")
     record("Python", "ok" if sys.version_info >= (3, 10) else "fail",
            f"{platform.python_version()}; Python 3.10+ is required")
     required = ["python3", "timeout", "ldd"]
+    # The bus registers slabs and host buffers with ibv_reg_mr — locked pages
+    # against RLIMIT_MEMLOCK. A login shell gets the serving user's limits
+    # (pam_limits), a service gets systemd's, and an agent's raw shell may get
+    # the 8 MiB default; probe the actual launch context for this rank.
+    try:
+        memlock = next(line for line in Path("/proc/self/limits").read_text().splitlines()
+                       if line.startswith("Max locked memory"))
+        soft = memlock.split()[3]
+        floor = 16 << 30
+        ok = soft == "unlimited" or (soft.isdigit() and int(soft) >= floor)
+        record("memlock", "ok" if ok else "fail",
+               f"{soft} locked memory; the bus registers slabs with ibv_reg_mr beyond the 8 MiB default — "
+               "set memlock unlimited for the serving user (limits.conf for login shells, "
+               "systemd DefaultLimitMEMLOCK for services and user sessions)" if not ok
+               else f"{soft} locked memory")
+    except (OSError, StopIteration) as error:
+        record("memlock", "fail", str(error))
     if spec["rank"] == 0:
         required += ["ssh", "scp", "curl", "jq"]
     if spec.get("preparing"):
@@ -221,7 +241,10 @@ def probe(spec):
         record("node address", "fail", f"run the launcher on DGPP_NODES[0]; check rank order and DNS: {error}")
     try:
         gpu = command(["nvidia-smi", "--query-gpu=name,compute_cap,memory.total", "--format=csv,noheader,nounits"])
-        record("GPU", "ok" if gpu.returncode == 0 and any("12.1" in line for line in gpu.stdout.splitlines()) else "fail",
+        # sm_120 (the 5070 Ti class) and sm_121 (GB10): the Blackwell caps the
+        # kernels are compiled for. nvidia-smi reports the base cap (12.0/12.1).
+        caps = [line.split(",")[1].strip() for line in gpu.stdout.splitlines() if line.count(",") >= 2]
+        record("GPU", "ok" if gpu.returncode == 0 and any(cap in ("12.0", "12.1") for cap in caps) else "fail",
                gpu.stdout.strip() or gpu.stderr.strip())
     except (OSError, subprocess.TimeoutExpired) as error:
         record("GPU", "fail", str(error))

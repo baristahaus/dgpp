@@ -644,7 +644,7 @@ JournalRecord decode_journal_line(std::string_view line) {
         (s.admission != "full" && s.admission != "grow") ||
         !latent_format_from_string(s.kv_dtype) ||
         (s.ngram_table != "resident" && s.ngram_table != "mmap") ||
-        (s.dense_weights != "checkpoint" && s.dense_weights != "fp8") ||
+        (s.dense_weights != "checkpoint" && s.dense_weights != "fp8" && s.dense_weights != "nvfp4") ||
         !parse_bf16_residency(s.bf16_weights, nullptr) ||
         (s.prefill != "bounded" && s.prefill != "exact") ||
         (s.embed_sharding != "replicated" && s.embed_sharding != "vocab"))

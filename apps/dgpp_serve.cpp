@@ -923,8 +923,11 @@ void check_memory_plan(
     headroom = host_headroom;
     dev_side_fits = host_side_fits = need + headroom <= budget;
   } else {
-    const size_t dev_need = plan.device_bytes();
-    const size_t host_need = plan.pinned_bytes() + prefix_arena_bytes + engine_bytes;
+    // A discrete GPU has two pools. The prefix arena is cudaMalloc'd
+    // device storage (engine/prefix_arena.hpp) — it belongs on the device
+    // side; the engine's pick/sampler scratch is pinned host.
+    const size_t dev_need = plan.device_bytes() + prefix_arena_bytes;
+    const size_t host_need = plan.pinned_bytes() + engine_bytes;
     budget = free_bytes;
     headroom = kDeviceHeadroomBytes;
     dev_side_fits = dev_need + kDeviceHeadroomBytes <= free_bytes;
@@ -944,23 +947,25 @@ void check_memory_plan(
     if (it.pinned) items += " (" + gib(static_cast<double>(it.pinned)) + " pinned)";
     items += "; ";
   }
-  DGPP_LOG_INFO("rank {}: memory plan for a {}-token context — {}prefix cache {}; engine {}",
+  DGPP_LOG_INFO("rank {}: memory plan for a {}-token context — {}prefix cache {} ({}); engine {}",
                 rank, plan.context_tokens, items, gib(static_cast<double>(prefix_arena_bytes)),
-                gib(static_cast<double>(engine_bytes)));
+                prop.integrated ? "unified" : "device", gib(static_cast<double>(engine_bytes)));
   DGPP_LOG_INFO(
       "rank {}: memory plan total {} ({} device + {} pinned) + {} headroom against {} free "
       "(device free {} of {}, host available {}{})",
-      rank, gib(static_cast<double>(need)), gib(static_cast<double>(plan.device_bytes())),
-      gib(static_cast<double>(plan.pinned_bytes() + prefix_arena_bytes + engine_bytes)),
+      rank, gib(static_cast<double>(need)),
+      gib(static_cast<double>(plan.device_bytes() + (prop.integrated ? 0 : prefix_arena_bytes))),
+      gib(static_cast<double>(plan.pinned_bytes() + engine_bytes +
+                              (prop.integrated ? prefix_arena_bytes : 0))),
       gib(static_cast<double>(headroom)), gib(static_cast<double>(budget)),
       gib(static_cast<double>(free_bytes)), gib(static_cast<double>(total_bytes)),
       gib(static_cast<double>(available)),
       prop.integrated ? "" :
           std::format("; discrete: device {} {} of {} free — {}; host {} {} of {} — {}",
-                      dev_side_fits ? "fits" : "over", gib(static_cast<double>(plan.device_bytes())),
+                      dev_side_fits ? "fits" : "over", gib(static_cast<double>(plan.device_bytes() + prefix_arena_bytes)),
                       gib(static_cast<double>(free_bytes)),
                       std::string(dev_side_fits ? "" : "BINDING"),
-                      host_side_fits ? "fits" : "over", gib(static_cast<double>(plan.pinned_bytes())),
+                      host_side_fits ? "fits" : "over", gib(static_cast<double>(plan.pinned_bytes() + engine_bytes)),
                       gib(static_cast<double>(available)),
                       std::string(dev_side_fits ? "BINDING" : "")));
   if (dev_side_fits && host_side_fits) return;
@@ -971,7 +976,8 @@ void check_memory_plan(
     const dgpp::MemoryPlan below = plan_at(plan.context_tokens - block_tokens);
     const auto side_bytes = [&](const dgpp::MemoryPlan& p) {
       return prop.integrated ? p.total_bytes()
-                             : (dev_side_fits ? p.pinned_bytes() : p.device_bytes());
+                             : (dev_side_fits ? p.pinned_bytes()
+                                              : p.device_bytes() + prefix_arena_bytes);
     };
     const double per_token =
         static_cast<double>(side_bytes(plan)) - static_cast<double>(side_bytes(below));
@@ -980,10 +986,11 @@ void check_memory_plan(
       const double fixed = static_cast<double>(side_bytes(plan)) -
                            per * static_cast<double>(plan.context_tokens) +
                            static_cast<double>(headroom) +
-                           // The arena and the engine buffers live in the
-                           // unified or the host pool — never the device's.
+                           // The engine's buffers are pinned host; the prefix
+                           // arena is device storage and already in
+                           // side_bytes on the binding (device) side.
                            static_cast<double>(prop.integrated || dev_side_fits
-                                                   ? prefix_arena_bytes + engine_bytes : 0);
+                                                   ? engine_bytes : 0);
       const double room = static_cast<double>(budget) - fixed;
       const int64_t feasible =
           room > 0 ? static_cast<int64_t>(room / per) / block_tokens * block_tokens : 0;
@@ -2174,8 +2181,9 @@ int main(int argc, char** argv) {
     // everything below the engine interface comes from it.
     std::unique_ptr<ServeFamily> family =
         make_family(ckpt, world, kv_format, rope_scaling, fp8_head == "mma");
-    if (fp8_head == "mma" && std::string(family->name()) != "qwen4_exp") {
-      DGPP_LOG_ERROR("engine.fp8_head mma requires the Qwen family and engine.dense_weights fp8");
+    if (fp8_head == "mma" && std::string(family->name()) != "qwen4_exp" &&
+        std::string(family->name()) != "qwen3_5") {
+      DGPP_LOG_ERROR("engine.fp8_head mma requires the Qwen family and engine.dense_weights fp8 or nvfp4");
       return 1;
     }
     if (rope_scaling.has_value() && std::string(family->name()) != "qwen4_exp") {

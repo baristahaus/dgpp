@@ -299,9 +299,15 @@ QwenModel::MemoryPlan QwenModel::plan_memory(const QwenTextConfig& cfg, int max_
   // The weights: every layer resident (the n-gram table always is), or
   // one streamed layer beside the globals and the table.
   if (residency == QwenResidency::Resident) {
-    plan.add(QwenLayerStream::ngram_table_mmap() ? "model weights (resident; the n-gram table mmap'ed from the checkpoint)"
-                                                 : "model weights (resident, n-gram table included)",
-             QwenLayerStream::resident_bytes(cfg, tp_rank, tp_world, head, mtp));
+    // Under the mmap'ed table the table's bytes stay behind the page cache:
+    // they are not device-resident (the staging line below carries the
+    // walk's pinned scratch instead).
+    const size_t table = QwenLayerStream::ngram_table_mmap()
+                             ? QwenLayerStream::ngram_table_bytes(cfg, tp_rank, tp_world) : 0;
+    plan.add(QwenLayerStream::ngram_table_mmap()
+                 ? "model weights (resident; the n-gram table mmap'ed from the checkpoint)"
+                 : "model weights (resident, n-gram table included)",
+             QwenLayerStream::resident_bytes(cfg, tp_rank, tp_world, head, mtp) - table);
     plan.add("loader staging (pinned host, freed when the last layer is resident)", 0,
              QwenLayerStream::staging_plan_bytes(cfg, tp_rank, tp_world, head, mtp));
   } else {

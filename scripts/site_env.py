@@ -30,7 +30,11 @@ SITE_KEYS = (
     "DGPP_BUS_TIMELINE", "DGPP_DSV41_DENSE_GEMV", "DGPP_DENSE_GEMV_ROWS", "DGPP_DSV41_EAGER_FOLD",
 )
 NODE_KEYS = ("DGPP_ROCE_DEVICES", "DGPP_ROCE_GID_INDICES", "HF_HUB_CACHE", "DGPP_RESIDENT_CACHE_DIR",
-    "DGPP_LOG_LEVEL", "DGPP_MLOCK",
+    "DGPP_LOG_LEVEL", "DGPP_MLOCK", "CUDA_VISIBLE_DEVICES",
+    # The CUDA JIT cache (PTX -> SASS for an arch the binary does not ship SASS
+    # for): a node override raises the 1 GiB default cap so a full first-boot
+    # JIT does not churn its own cache with LRU evictions.
+    "CUDA_CACHE_MAXSIZE",
     # The engine's L2 weight-prefetch knobs (src/kernels/l2_prefetch.hpp): an A/B runs
     # with the same setting on every rank.
     "DGPP_L2_PREFETCH", "DGPP_L2_PREFETCH_MB", "DGPP_L2_PREFETCH_BOUNDARY", "DGPP_L2_PREFETCH_LAYER",
@@ -117,8 +121,11 @@ def site_nodes(values):
         raise ValueError("set DGPP_NODES in .env to the node addresses in rank order")
     if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]*", node) for node in nodes):
         raise ValueError("DGPP_NODES must contain space-separated IP addresses or hostnames")
-    if len(set(nodes)) != len(nodes):
-        raise ValueError("DGPP_NODES must not contain duplicate nodes")
+    # A name may repeat: the list is in rank order, and a host listed N times
+    # hosts N ranks (stacking a multi-GPU node). Give the ranks apart settings
+    # with rank-suffixed DGPP_NODE_OVERRIDES keys: "host#1" targets its second
+    # rank. An accidental repeat fails loudly at boot (the peer cannot bind the
+    # same fabric/journal ports the head holds).
     return nodes
 
 
@@ -212,14 +219,21 @@ def node_environments(values, nodes=None):
         overrides = json.loads(values.get("DGPP_NODE_OVERRIDES") or "{}")
     except json.JSONDecodeError as error:
         raise ValueError("DGPP_NODE_OVERRIDES must be a JSON object") from error
-    if not isinstance(overrides, dict) or set(overrides) - set(site_nodes(values)):
-        raise ValueError("DGPP_NODE_OVERRIDES must map configured node names to settings")
-    for host, override in overrides.items():
+    known_hosts = site_nodes(values)
+    for key, override in overrides.items():
+        host, _, rank = key.partition("#")
+        if host not in known_hosts:
+            raise ValueError("DGPP_NODE_OVERRIDES must map configured node names to settings")
+        if rank and (not rank.isdigit() or int(rank) >= len(known_hosts)):
+            raise ValueError(f"invalid rank suffix in DGPP_NODE_OVERRIDES key '{key}'")
         if not isinstance(override, dict) or set(override) - set(NODE_KEYS):
-            raise ValueError(f"invalid node settings for {host}; allowed: {', '.join(NODE_KEYS)}")
+            raise ValueError(f"invalid node settings for {key}; allowed: {', '.join(NODE_KEYS)}")
     result = []
-    for host in nodes:
-        env = {**common, **overrides.get(host, {})}
+    for rank, host in enumerate(nodes):
+        # A repeated host (ranks stacked on one machine) pins its ranks apart
+        # with rank-suffixed keys: a bare 'host' entry applies to every rank
+        # on it, 'host#1' only to its second rank.
+        env = {**common, **overrides.get(host, {}), **overrides.get(f"{host}#{rank}", {})}
         if any(not isinstance(value, str) or any(c in value for c in "\0\r\n") for value in env.values()):
             raise ValueError(f"node settings for {host} must be single-line strings")
         devices = env.get("DGPP_ROCE_DEVICES", "").split()
@@ -233,6 +247,9 @@ def node_environments(values, nodes=None):
         for key in ("HF_HUB_CACHE", "DGPP_RESIDENT_CACHE_DIR"):
             if env.get(key) and not env[key].startswith(("/", "~/")):
                 raise ValueError(f"{key} for {host} must be an absolute or ~/ path")
+        cuda = env.get("CUDA_VISIBLE_DEVICES")
+        if cuda and not re.fullmatch(r"[0-9]+(?:,[0-9]+)*", cuda):
+            raise ValueError(f"CUDA_VISIBLE_DEVICES for {host} rank {rank} must be a comma-separated device list")
         result.append(env)
     return result
 
