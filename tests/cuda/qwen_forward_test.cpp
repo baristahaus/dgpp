@@ -1,8 +1,7 @@
 // The Qwen3.8-Flash-Next world-1 forward.
 //
 // Modes:
-//   --write-fixture DIR          the tiny synthetic checkpoint (tests/cuda/qwen_fixture.hpp);
-//                                --dense writes the Qwen3.8-27B twin instead
+//   --write-fixture DIR          the tiny synthetic checkpoint (tests/cuda/qwen_fixture.hpp)
 //   --smoke DIR                  QwenModel over the fixture: finite outputs, bitwise repeat
 //   --qsa-prefill DIR --logits FILE  warp/partial comparison fixture and long-prefill logits
 //   --rope-scaling F:O[:BF:BS:AF:MF]  run --smoke with the engine's YaRN knob
@@ -629,11 +628,10 @@ int run_dump_parity(const std::string& dir, const std::string& dump_path) {
 int main(int argc, char** argv) {
   std::string fixture, smoke, checkpoint, dump, cross_limit, qsa_prefill, logits_path;
   std::string rope_scaling_arg;
-  bool plan_check = false, w4a4_plan_check = false, gptq = false, dense = false;
+  bool plan_check = false, w4a4_plan_check = false, gptq = false;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--write-fixture" && i + 1 < argc) fixture = argv[++i];
-    else if (a == "--dense") dense = true;
     else if (a == "--smoke" && i + 1 < argc) smoke = argv[++i];
     else if (a == "--rope-scaling" && i + 1 < argc) rope_scaling_arg = argv[++i];
     else if (a == "--cross-limit" && i + 1 < argc) cross_limit = argv[++i];
@@ -668,11 +666,8 @@ int main(int argc, char** argv) {
       rope_scaling = rs;
     }
     if (!fixture.empty()) {
-      // --gptq: the AutoRound hybrid's twin (tests/cuda/qwen_fixture.hpp);
-      // --dense: the Qwen3.8-27B's plain-residual twin.
-      qwenfx::write_fixture_for(dense ? qwenfx::tiny_dense_config()
-                                      : (gptq ? qwenfx::tiny_gptq_config() : qwenfx::tiny_config()),
-                                fixture);
+      // --gptq: the AutoRound hybrid's twin (tests/cuda/qwen_fixture.hpp).
+      qwenfx::write_fixture_for(gptq ? qwenfx::tiny_gptq_config() : qwenfx::tiny_config(), fixture);
       std::printf("[ OK ] wrote the fixture to %s\n", fixture.c_str());
       return 0;
     }

@@ -56,18 +56,14 @@ int main(int argc, char** argv) {
       if (ckpt.empty()) throw std::runtime_error("cannot resolve " + model_id + ": " + err);
     }
     const std::string cfg_path = (std::filesystem::path(ckpt) / "config.json").string();
-    const dgpp::ModelArchitecture arch = dgpp::detect_architecture_file(cfg_path);
-    if (arch != dgpp::ModelArchitecture::Qwen4Exp && arch != dgpp::ModelArchitecture::Qwen35)
-      throw std::runtime_error("not a Qwen4Exp/Qwen3.5 checkpoint: " + ckpt);
+    if (dgpp::detect_architecture_file(cfg_path) != dgpp::ModelArchitecture::Qwen4Exp)
+      throw std::runtime_error("not a Qwen4Exp checkpoint: " + ckpt);
     dgpp::QwenTextConfig cfg = dgpp::QwenTextConfig::from_json_file(cfg_path);
     if (!image_dir.empty()) dgpp::QwenLayerStream::set_resident_image_dir(image_dir == "off" ? "" : image_dir);
     if (!ngram_table.empty()) dgpp::QwenLayerStream::set_ngram_table_mmap(ngram_table == "mmap");
     if (!ngram_table_dir.empty()) dgpp::QwenLayerStream::set_ngram_table_dir(ngram_table_dir);
     if (cfg.dense_fp8_shipped) dgpp::QwenLayerStream::set_dense_weights_fp8(true);  // the hybrid ships fp8
-    if (!dense_weights.empty()) {  // checkpoint | fp8 | nvfp4 (docs/qwen38_dual_spark.md)
-      dgpp::QwenLayerStream::set_dense_weights_fp8(dense_weights == "fp8" || dense_weights == "nvfp4");
-      dgpp::QwenLayerStream::set_dense_mlp_nvfp4(dense_weights == "nvfp4");
-    }
+    if (!dense_weights.empty()) dgpp::QwenLayerStream::set_dense_weights_fp8(dense_weights == "fp8");
     if (!mtp_expert_format.empty()) dgpp::QwenLayerStream::set_mtp_expert_format(mtp_expert_format == "bf16_fused");
     cfg.mtp_experts_bf16_fused = dgpp::QwenLayerStream::mtp_experts_bf16_fused();
     const dgpp::QwenResidency residency = streaming ? dgpp::QwenResidency::Streaming : dgpp::QwenResidency::Resident;

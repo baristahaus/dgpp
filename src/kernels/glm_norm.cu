@@ -122,20 +122,23 @@ __global__ void glm_rows_scatter_kernel(const uint16_t* __restrict__ rows,
   for (int j = threadIdx.x; j < hidden / 8; j += blockDim.x) dst[j] = src[j];
 }
 
-// streams[t, s, :] = embed[tokens[t], :] for the residual streams — GLM's
-// four branches, the Qwen GR form's hc_count, one for the dense form.
+// streams[t, s, :] = embed[tokens[t], :] for the four residual streams —
+// the reference's unsqueeze+expand of the embedding.
 __global__ void glm_embed_bcast_kernel(const uint16_t* __restrict__ table,
                                        const int64_t* __restrict__ tokens,
                                        uint16_t* __restrict__ streams,
-                                       int hidden, int branches) {
+                                       int hidden) {
   const int t = blockIdx.x;
   const uint16_t* src =
       table + static_cast<int64_t>(tokens[t]) * hidden;
-  uint16_t* dst = streams + static_cast<size_t>(t) * branches * hidden;
+  uint16_t* dst = streams + static_cast<size_t>(t) * 4 * hidden;
   for (int h = threadIdx.x + blockIdx.y * blockDim.x; h < hidden;
        h += blockDim.x * gridDim.y) {
     const uint16_t v = src[h];
-    for (int b = 0; b < branches; ++b) dst[b * hidden + h] = v;
+    dst[h] = v;
+    dst[hidden + h] = v;
+    dst[2 * hidden + h] = v;
+    dst[3 * hidden + h] = v;
   }
 }
 
@@ -270,16 +273,14 @@ void glm_rows_scatter_bf16_batched(
 
 void glm_embed_bcast_streams(const void* embed_table, const int64_t* tokens,
                              void* streams, int num_tokens, int hidden,
-                             int branches, cudaStream_t stream) {
+                             cudaStream_t stream) {
   if (num_tokens <= 0) return;
-  if (branches <= 0)
-    throw std::invalid_argument("glm_embed_bcast_streams: branches must be positive");
   const int blocks_y = (hidden + kBlock - 1) / kBlock;
   dim3 grid(static_cast<unsigned>(num_tokens),
             static_cast<unsigned>(blocks_y));
   glm_embed_bcast_kernel<<<grid, kBlock, 0, stream>>>(
       static_cast<const uint16_t*>(embed_table), tokens,
-      static_cast<uint16_t*>(streams), hidden, branches);
+      static_cast<uint16_t*>(streams), hidden);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 

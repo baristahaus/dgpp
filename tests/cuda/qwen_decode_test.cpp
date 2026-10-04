@@ -31,7 +31,6 @@
 #include "common/bf16_residency.hpp"
 #include "common/dtypes.hpp"
 #include "engine/speculative.hpp"
-#include "kernels/fp4_gemv.hpp"
 #include "kernels/gemm.hpp"
 #include "models/qwen/config.hpp"
 #include "models/qwen/forward.hpp"
@@ -872,106 +871,6 @@ int run_fixture(const std::string& dir, bool fp8_head = false) {
   return 0;
 }
 
-// The at-load NVFP4 MLP (engine.dense_weights = "nvfp4",
-// docs/qwen38_dual_spark.md) on the dense twin: every decode-shaped walk
-// (<= 128 rows) through the fp4 GEMV, and one prefill across the boundary
-// (160 rows in one enqueue — the dequantized BF16 bridge), each audited
-// against the re-forward. The knobs are set by the caller
-// (--dense-mlp-fp4), which also implies the fp8 dense stack.
-int run_fixture_fp4(const std::string& dir) {
-  const QwenTextConfig cfg = QwenTextConfig::from_json_file((fs::path(dir) / "config.json").string());
-  require(!cfg.has_moe(), "the nvfp4 MLP form is the dense form's");
-  // The dual-spark shape gate (docs/qwen38_dual_spark.md): the real 27B's
-  // dims at world 2 — the slice's Ks must be in the fp4 GEMV's compiled
-  // set, and the prefill bridge, which gemm_dense_fp4 dequantizes into
-  // with no fallback, must hold the MLP's slice — which bounds q_proj's
-  // there. Shape math only; the tiny fixture below cannot see it (its MLP
-  // is far smaller than its q_proj, so its bridge holds either way).
-  {
-    // layer_types: [linear x3, full] x 16 — 64 entries.
-    std::string layer_types;
-    for (int i = 0; i < 16; ++i)
-      layer_types += "\"linear_attention\",\"linear_attention\",\"linear_attention\",\"full_attention\"" +
-                     std::string(i == 15 ? 0 : 1, ',');
-    const std::string json =
-      "{\"model_type\": \"qwen3_5_text\", \"attention_bias\": false, \"head_dim\": 256, "
-      "\"hidden_act\": \"silu\", \"hidden_size\": 5120, \"intermediate_size\": 17408, "
-      "\"layer_types\": [" + layer_types + "], \"linear_conv_kernel_dim\": 4, "
-      "\"linear_key_head_dim\": 128, \"linear_num_key_heads\": 16, \"linear_num_value_heads\": 48, "
-      "\"linear_value_head_dim\": 128, \"mamba_ssm_dtype\": \"float32\", "
-      "\"max_position_embeddings\": 262144, \"mtp_num_hidden_layers\": 1, "
-      "\"mtp_use_dedicated_embeddings\": false, \"num_attention_heads\": 24, "
-      "\"num_hidden_layers\": 64, \"num_key_value_heads\": 4, \"output_gate_type\": \"swish\", "
-      "\"rms_norm_eps\": 1e-06, \"rope_parameters\": {\"mrope_interleaved\": true, "
-      "\"mrope_section\": [11, 11, 10], \"partial_rotary_factor\": 0.25, "
-      "\"rope_theta\": 10000000, \"rope_type\": \"default\"}, "
-      "\"tie_word_embeddings\": false, \"vocab_size\": 248064}";
-    const auto parsed = dgpp::minijson::parse(json);
-    const QwenTextConfig real = QwenTextConfig::parse(parsed.root, nullptr);
-    const dgpp::QwenLocalGeometry geo =
-        dgpp::QwenLocalGeometry::from_config(real, 1, 2, dgpp::QwenHeadSharding::Full);
-    const auto accepts_k = [](int64_t k) {
-      dgpp::GlmFp4Matrix w;
-      w.payload = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(16));
-      w.scales = w.payload;
-      w.global_scale = reinterpret_cast<const float*>(w.payload);
-      w.cols = k;
-      return dgpp::fp4_gemv_accepts(w);
-    };
-    require(accepts_k(geo.local_inter) && accepts_k(real.hidden_size),
-            "world 2: the MLP's slice Ks (8704, 5120) are in the fp4 GEMV's compiled set");
-    require(!accepts_k(real.intermediate_size) && !accepts_k(real.intermediate_size / 4),
-            "worlds 1 and 4 stay off the fp4 path (down K not compiled)");
-    const size_t q_proj_elems = static_cast<size_t>(geo.local_heads) * 2 * real.head_dim *
-                                static_cast<size_t>(real.hidden_size);
-    const size_t mlp_elems = static_cast<size_t>(geo.local_inter) * static_cast<size_t>(real.hidden_size);
-    require(mlp_elems > q_proj_elems, "world 2: the MLP's slice bounds q_proj (the bridge's old bound)");
-    require(QwenModel::dense_bridge_bytes(real, geo) == mlp_elems * 2,
-            "nvfp4: the prefill bridge holds the MLP's slice");
-    dgpp::QwenLayerStream::set_dense_mlp_nvfp4(false);
-    require(QwenModel::dense_bridge_bytes(real, geo) == q_proj_elems * 2,
-            "fp8: the bridge stays q_proj-sized");
-    dgpp::QwenLayerStream::set_dense_mlp_nvfp4(true);
-    std::printf("[ OK ] fp4: the world-2 shape gate — the slice Ks compiled, the bridge holds the MLP (85 MiB over q_proj's 60)\n");
-  }
-  const std::vector<int64_t> A = smoke_tokens(cfg, 23, 0x9E3779B97F4A7C15ull);
-  const std::vector<int64_t> Long = smoke_tokens(cfg, 160, 0xD1B54A32D192ED03ull);
-  QwenModel m(cfg, dir, /*max_tokens=*/256, /*max_cache_tokens=*/320, QwenResidency::Resident, nullptr,
-              0, 1, /*max_requests=*/2);
-  const int V = m.lm_vocab_count();
-  // 1. The short prompt: every dense MLP call at <= 128 rows — the GEMV.
-  {
-    const QwenModel::Outputs f = m.forward(A);
-    const QwenModel::Outputs p = m.session_prefill(0, A);
-    const std::vector<float> last(f.logits.end() - V, f.logits.end());
-    require(bitwise(p.logits, last), "fp4: the 23-row prefill's last row is bitwise the forward's");
-    m.session_close(0);
-    const Transcript t = greedy(m, 0, A, 12);
-    m.session_close(0);
-    const int soft = audit(m, A, t, "fp4 decode 12 steps", 2e-2);
-    std::printf("[ OK ] fp4: the GEMV-path prefill is bitwise and a 12-step decode matches the re-forward (%d near ties)\n",
-                soft);
-  }
-  // 2. The 160-row prefill: the MLP's bridge (one dequant per chunk, the
-  // bf16 GEMM), still bitwise against the 160-row forward's last row.
-  {
-    const QwenModel::Outputs f = m.forward(Long);
-    require(f.logits.size() == static_cast<size_t>(V) * Long.size(), "fp4: the forward's logits rows");
-    const QwenModel::Outputs p = m.session_prefill(0, Long);
-    const std::vector<float> last(f.logits.end() - V, f.logits.end());
-    require(bitwise(p.logits, last), "fp4: the 160-row prefill's last row is bitwise the forward's (the bridge path)");
-    m.session_close(0);
-    const Transcript t = greedy(m, 0, Long, 12);
-    m.session_close(0);
-    // The steps (the GEMV) against the re-forward (172 rows — the bridge):
-    // cross-path, tolerance-gated like the group prefill's span compare.
-    const int soft = audit(m, Long, t, "fp4 decode after the bridge prefill", 1e-1);
-    std::printf("[ OK ] fp4: the 160-row bridge prefill is bitwise and its decode matches the re-forward (%d near ties)\n",
-                soft);
-  }
-  return 0;
-}
-
 // ---- the real checkpoint ---------------------------------------------------------
 // Seven streaming walks: the prefill against the cold forward of the same
 // prompt (bitwise expected: the same m=P GEMMs), the greedy steps, the
@@ -1086,7 +985,7 @@ int run_checkpoint(const std::string& dir, const std::vector<int64_t>& ids, int 
 
 int main(int argc, char** argv) {
   std::string fixture, checkpoint, ids_text;
-  bool fp8_head = false, prefill_head = false, dense_fp8 = false, dense_mlp_fp4 = false;
+  bool fp8_head = false, prefill_head = false, dense_fp8 = false;
   int steps = 4;
   int layers_extra = -1;
   for (int i = 1; i < argc; ++i) {
@@ -1098,19 +997,14 @@ int main(int argc, char** argv) {
       prefill_head = true;
     else if (a == "--dense-fp8")  // the whole run under engine.dense_weights = fp8
       dense_fp8 = true;
-    else if (a == "--dense-mlp-fp4")  // ... = "nvfp4" (docs/qwen38_dual_spark.md)
-      dense_mlp_fp4 = true;
     else if (a == "--checkpoint-dir" && i + 1 < argc) checkpoint = argv[++i];
     else if (a == "--ids" && i + 1 < argc) ids_text = argv[++i];
     else if (a == "--steps" && i + 1 < argc) steps = std::stoi(argv[++i]);
     else if (a == "--layers" && i + 1 < argc) layers_extra = std::stoi(argv[++i]);
   }
   try {
-    if (dense_fp8 || dense_mlp_fp4) dgpp::QwenLayerStream::set_dense_weights_fp8(true);
-    if (dense_mlp_fp4) dgpp::QwenLayerStream::set_dense_mlp_nvfp4(true);
-    if (!fixture.empty())
-      return prefill_head ? run_prefill_head(fixture)
-                          : dense_mlp_fp4 ? run_fixture_fp4(fixture) : run_fixture(fixture, fp8_head);
+    if (dense_fp8) dgpp::QwenLayerStream::set_dense_weights_fp8(true);
+    if (!fixture.empty()) return prefill_head ? run_prefill_head(fixture) : run_fixture(fixture, fp8_head);
     if (!checkpoint.empty()) {
       std::vector<int64_t> ids;
       std::stringstream ss(ids_text);

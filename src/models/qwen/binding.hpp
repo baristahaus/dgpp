@@ -30,7 +30,6 @@ namespace dgpp {
 enum class QwenWeightClass : int {
   Embed,
   LmHead,
-  Norm,          // the plain-residual form's RMSNorm vectors (the dense 27B)
   Mixer,         // the model-level hyper_connection_mixer (mix only)
   Gr,            // a layer's attn/mlp gated-residual sites
   Gdn,
@@ -38,11 +37,13 @@ enum class QwenWeightClass : int {
   QsaIndexer,
   Router,        // mlp.gate and mlp.shared_expert_gate
   SharedExpert,
-  DenseMlp,      // the dense form's SwiGLU MLP (the 27B's full-width gate/up/down)
   RoutedExpert,
   Ple,           // the PLE projections, norms, conv and hash buffers
   PleTable,      // the n-gram table shards and their scale
   Mtp,           // the draft head's own tensors (fc_*, pre_fc norms, mixer)
+  Norm,          // qwen3_5 RMSNorm vectors (layer norms, final norm)
+  FullAttn,      // qwen3_5 full-attention projections and q/k norms
+  DenseMlp,      // qwen3_5 dense SwiGLU gate/up/down projections
 };
 
 enum class QwenTensorRole : uint8_t {

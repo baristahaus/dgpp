@@ -162,12 +162,6 @@ class QwenModel : public SessionModel<QwenModel> {
   static constexpr int kv_block_tokens_static() { return kBlockTokens; }
   // The same number for a shape that is not built yet (the memory plan).
   static size_t session_snapshot_bytes(const QwenTextConfig& cfg, int tp_world, bool mtp);
-  // The FP8 dense stack's prefill bridge, in bytes: the largest dense
-  // matrix of this rank's slice in BF16 (the MLP's slice included under
-  // engine.dense_weights = "nvfp4", which has no scale-GEMM fallback —
-  // gemm_dense_fp4 dequantizes into it or fails). Public for the decode
-  // test's world-2 shape gate (docs/qwen38_dual_spark.md).
-  static size_t dense_bridge_bytes(const QwenTextConfig& cfg, const QwenLocalGeometry& geo);
   using Base::session_snapshot_bytes;
 
   const QwenTextConfig& config() const { return cfg_; }
@@ -272,6 +266,7 @@ class QwenModel : public SessionModel<QwenModel> {
   void build_layer_objects(const QwenLayerResident& r);
   void lm_head_logits(const uint16_t* hidden, int rows, cudaStream_t stream, bool last_row_only = false,
                       int compact_row = -1, int output_row = 0);
+  static size_t dense_bridge_bytes(const QwenTextConfig& cfg, const QwenLocalGeometry& geo);
   // The opt-in fp8 prefill GEMM's activation scratch (engine.prefill_fp8_gemm):
   // the widest dense k of this rank's slice, and the scratch's bytes for
   // max_tokens rows (e4m3 rows plus their 1 x 128 fp32 scales).
@@ -330,14 +325,6 @@ class QwenModel : public SessionModel<QwenModel> {
 
   // Layer objects (built at first use, rebound per layer).
   std::unique_ptr<QwenGrSite> attn_gr_, mlp_gr_, mixer_;
-  // The plain-residual form (the dense 27B): the same two sites + the final
-  // read as QwenPlainSite, and the layer's SwiGLU MLP. The walk composes
-  // through the QwenResidualSite pointers.
-  std::unique_ptr<QwenPlainSite> attn_plain_, mlp_plain_, mixer_plain_;
-  QwenResidualSite* attn_site_ = nullptr;
-  QwenResidualSite* mlp_site_ = nullptr;
-  QwenResidualSite* mixer_site_ = nullptr;
-  std::unique_ptr<QwenDenseMlp> mlp_;
   std::unique_ptr<QwenGdnLayer> gdn_;
   std::unique_ptr<QwenQsaLayer> qsa_;
   std::unique_ptr<QwenMoeLayer> moe_;
@@ -401,7 +388,7 @@ class QwenModel : public SessionModel<QwenModel> {
   void prefetch_gr(const QwenGrResident& g, bool inject);
   void prefetch_ffn_side(const QwenLayerResident& r);
   void prefetch_attention_side(int layer);
-  void prefetch_head(const QwenGrResident& mixer, const uint16_t* plain_norm = nullptr);
+  void prefetch_head(const QwenGrResident& mixer);
   void prefetch_add(const char* what, const void* p, size_t bytes);
   // A bf16 matmul weight into the open window: the bytes the walk's launch
   // streams — its packed companion's when the GEMM holds one.
@@ -422,8 +409,6 @@ class QwenModel : public SessionModel<QwenModel> {
   uint16_t* mtp_enc_ = nullptr;         // [M, W] fc_hidden per branch
   uint16_t* mtp_r_ = nullptr;           // [M, W] the block's hyper state
   std::unique_ptr<QwenGrSite> mtp_mixer_;
-  std::unique_ptr<QwenPlainSite> mtp_mixer_plain_;
-  QwenResidualSite* mtp_mixer_site_ = nullptr;
 };
 
 }  // namespace dgpp

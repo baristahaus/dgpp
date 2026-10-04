@@ -163,8 +163,7 @@ int main(int argc, char** argv) {
         run(model);
         break;
       }
-      case ModelArchitecture::Qwen4Exp:
-      case ModelArchitecture::Qwen35: {
+      case ModelArchitecture::Qwen4Exp: {
         auto cfg = QwenTextConfig::from_json_file(config);
         QwenLayerStream::set_resident_image_dir(image_dir);
         QwenLayerStream::set_dense_weights_fp8(true);

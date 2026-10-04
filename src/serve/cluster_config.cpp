@@ -151,6 +151,9 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         static const char* const kNodeKeys[] = {
             "DGPP_ROCE_DEVICES", "DGPP_ROCE_GID_INDICES", "HF_HUB_CACHE", "DGPP_RESIDENT_CACHE_DIR",
             "DGPP_LOG_LEVEL", "DGPP_MLOCK", "CUDA_VISIBLE_DEVICES",
+            // The CUDA JIT cache cap: raised on a node that runs the binary on an
+            // arch it ships no SASS for (PTX JIT at first launch).
+            "CUDA_CACHE_MAXSIZE",
             "DGPP_L2_PREFETCH", "DGPP_L2_PREFETCH_MB", "DGPP_L2_PREFETCH_BOUNDARY", "DGPP_L2_PREFETCH_LAYER",
             // The bus timeline switch and the dense-lowering A/B switches: every rank the same.
             "DGPP_BUS_TIMELINE", "DGPP_DSV41_DENSE_GEMV", "DGPP_DENSE_GEMV_ROWS", "DGPP_DSV41_EAGER_FOLD"};
@@ -226,6 +229,8 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
           e.prefill_fold_scales = boolean(x, ek, what);
         } else if (p.key == "prefill_fp8_gemm") {
           e.prefill_fp8_gemm = boolean(x, ek, what);
+        } else if (p.key == "prefill_fp8_per_tensor") {
+          e.prefill_fp8_per_tensor = boolean(x, ek, what);
         } else if (p.key == "expert_gemm") {
           e.expert_gemm = text(x, ek, what);
           if (e.expert_gemm != "wide" && e.expert_gemm != "wide3" && e.expert_gemm != "wide4" &&
@@ -305,8 +310,12 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         else if (p.key == "no_eos") e.no_eos = boolean(x, ek, what);
         else if (p.key == "decode_graph") e.decode_graph = boolean(x, ek, what);
         else if (p.key == "mtp") e.mtp = boolean(x, ek, what);
+        else if (p.key == "dflash_model") e.dflash_model = text(x, ek, what);
+        else if (p.key == "dflash_verify_graph") e.dflash_verify_graph = boolean(x, ek, what);
+        else if (p.key == "dflash_draft_batch") e.dflash_draft_batch = boolean(x, ek, what);
+        else if (p.key == "dflash_depth") e.dflash_depth = static_cast<int>(integer(x, ek, what, 0, 7));
         else if (p.key == "mtp_depth") {
-          e.mtp_depth = static_cast<int>(integer(x, ek, what, 1, 5));  // kSpecRows - 1
+          e.mtp_depth = static_cast<int>(integer(x, ek, what, 1, 5));  // the MTP families' chains; the DFlash2 block is its checkpoint's
           e.mtp_depth_set = true;
         } else if (p.key == "compact_batches")
           e.compact_batches = boolean(x, ek, what);

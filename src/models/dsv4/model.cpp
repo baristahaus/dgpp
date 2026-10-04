@@ -801,7 +801,7 @@ void Dsv4Model::fold(uint16_t* buf, int T, int width, bool capture) {
 void Dsv4Model::gather_embedding(const int64_t* tokens, int T, bool capture) {
   const int H = cfg_.hidden_size;
   if (!embed_sharded_) {
-    glm_embed_bcast_streams(globals_.embed, tokens, cur_, T, H, 4, stream_);
+    glm_embed_bcast_streams(globals_.embed, tokens, cur_, T, H, stream_);
     return;
   }
   uint16_t* e = stage(x_, T, H, capture);

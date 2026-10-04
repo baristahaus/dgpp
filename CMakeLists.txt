@@ -168,8 +168,9 @@ add_library(dgpp_kernels STATIC
   src/kernels/kda.cu
   src/kernels/dsa.cu
   src/kernels/fp8_dequant.cu
-  src/kernels/fp4_dequant.cu
   src/kernels/fp8_gemm.cu
+  src/kernels/fp8w_gemm.cu
+  src/kernels/fp8_per_tensor.cu
   src/kernels/fp4_gemv.cu
   src/kernels/packq_gemv.cu
   src/kernels/packq_gemm.cu
@@ -200,9 +201,11 @@ add_library(dgpp_kernels STATIC
   src/kernels/csa2.cu
   src/kernels/dsv4_attn.cu
   src/kernels/qwen_mtp.cu
+  src/kernels/dflash2.cu
   src/kernels/qsa.cu
   src/kernels/qsa_warp.cu
   src/kernels/qsa_prefill.cu
+  src/kernels/full_attn.cu
   src/kernels/glm4_attn.cu
   src/kernels/mimo_attn.cu
   src/kernels/mimo_mtp_history.cu
@@ -424,6 +427,8 @@ dgpp_set_common(dgpp_models_dsv4_layers)
 add_library(dgpp_models_qwen STATIC
   src/models/qwen/config.cpp
   src/models/qwen/binding.cpp
+  src/models/qwen/config35.cpp
+  src/models/qwen/binding35.cpp
   src/models/qwen/gdn_reference.cpp
   src/models/qwen/norm_reference.cpp
   src/models/qwen/gr_reference.cpp
@@ -437,7 +442,9 @@ dgpp_set_common(dgpp_models_qwen)
 # TP geometry, plus the n-gram table's own residency.
 add_library(dgpp_models_qwen_loader STATIC
   src/models/qwen/vision.cpp
-  src/models/qwen/loader.cpp)
+  src/models/qwen/loader.cpp
+  src/models/qwen/loader35.cpp
+  src/models/qwen/dflash2.cpp)
 target_include_directories(dgpp_models_qwen_loader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dgpp_models_qwen_loader PUBLIC dgpp_models_qwen dgpp_loaders dgpp_kernels CUDA::cudart dgpp_device_ranges)
 dgpp_set_common(dgpp_models_qwen_loader)
@@ -448,7 +455,9 @@ add_library(dgpp_models_qwen_layers STATIC
   src/models/qwen/moe_reference.cpp
   src/models/qwen/layers.cpp
   src/models/qwen/kv_pool.cpp
-  src/models/qwen/forward.cpp)
+  src/models/qwen/forward.cpp
+  src/models/qwen/model35.cpp
+  src/models/qwen/model35_kernels.cu)
 target_include_directories(dgpp_models_qwen_layers PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dgpp_models_qwen_layers
   PUBLIC dgpp_models_qwen dgpp_models_qwen_loader dgpp_models_moe dgpp_models_glm dgpp_kernels CUDA::cudart)
@@ -561,17 +570,6 @@ add_test(NAME qwen_prefill_head_all_rows
           $<TARGET_FILE:qwen_decode_test> --fixture ${QWEN_FORWARD_FIXTURE} --prefill-head)
 set_tests_properties(qwen_prefill_head qwen_prefill_head_all_rows
   PROPERTIES DEPENDS qwen_forward_fixture LABELS "gpu" RUN_SERIAL TRUE)
-
-# The dense 27B's twin under the at-load NVFP4 MLP (engine.dense_weights =
-# "nvfp4", docs/qwen38_dual_spark.md): the fp4 GEMV's decode walks and the
-# 160-row prefill across the fp8 bridge's boundary.
-set(QWEN_DENSE_FORWARD_FIXTURE ${CMAKE_CURRENT_BINARY_DIR}/qwen_dense_forward_fixture)
-add_test(NAME qwen_dense_forward_fixture
-  COMMAND qwen_forward_test --write-fixture ${QWEN_DENSE_FORWARD_FIXTURE} --dense)
-add_test(NAME qwen_dense_mlp_fp4_decode
-  COMMAND qwen_decode_test --fixture ${QWEN_DENSE_FORWARD_FIXTURE} --dense-mlp-fp4)
-set_tests_properties(qwen_dense_mlp_fp4_decode
-  PROPERTIES DEPENDS qwen_dense_forward_fixture LABELS "gpu" RUN_SERIAL TRUE)
 
 add_executable(qwen_image_prefill_test tests/cuda/qwen_image_prefill_test.cpp)
 target_include_directories(qwen_image_prefill_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
@@ -813,6 +811,10 @@ add_executable(unit_tests
   tests/unit/qwen_config_test.cpp
   tests/unit/qwen_image_stage_test.cpp
   tests/unit/qwen_binding_test.cpp
+  tests/unit/qwen35_config_test.cpp
+  tests/unit/qwen35_binding_test.cpp
+  tests/unit/qwen_dflash2_config_test.cpp
+  tests/unit/dflash2_speculator_test.cpp
   tests/unit/qwen_rope_scaling_test.cpp
   tests/unit/glm4_config_test.cpp
   tests/unit/glm4_binding_test.cpp
@@ -829,7 +831,8 @@ add_executable(unit_tests
   src/core/trace.cpp)
 target_include_directories(unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(unit_tests PRIVATE CUDA::cudart dgpp_loaders
-                                        dgpp_models_glm dgpp_models_qwen dgpp_models_glm4
+                                        dgpp_models_glm dgpp_models_qwen dgpp_models_qwen_loader
+                                        dgpp_models_glm4
                                         dgpp_models_glm_dsa dgpp_models_dsv41 dgpp_models_dsv4 dgpp_models_mimo
                                         dgpp_rope_scaling
                                         dgpp_net dgpp_serve Threads::Threads)
@@ -1072,6 +1075,12 @@ target_link_libraries(qwen_norm_test PRIVATE dgpp_models_qwen dgpp_kernels CUDA:
 dgpp_set_common(qwen_norm_test)
 add_test(NAME qwen_norm_test COMMAND qwen_norm_test)
 
+add_executable(dflash2_kernels_test tests/cuda/dflash2_kernels_test.cu)
+target_include_directories(dflash2_kernels_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(dflash2_kernels_test PRIVATE dgpp_kernels CUDA::cudart Threads::Threads)
+dgpp_set_common(dflash2_kernels_test)
+add_test(NAME dflash2_kernels_test COMMAND dflash2_kernels_test)
+
 add_executable(gdn_test tests/cuda/gdn_test.cu)
 target_include_directories(gdn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
 target_link_libraries(gdn_test PRIVATE dgpp_models_qwen dgpp_models_kda CUDA::cudart Threads::Threads)
@@ -1207,6 +1216,62 @@ target_include_directories(glm4_attn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/sr
 target_link_libraries(glm4_attn_test PRIVATE dgpp_models_glm4 dgpp_kernels CUDA::cudart Threads::Threads)
 dgpp_set_common(glm4_attn_test)
 add_test(NAME glm4_attn_test COMMAND glm4_attn_test)
+
+add_executable(full_attn_test tests/cuda/full_attn_test.cu)
+target_include_directories(full_attn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(full_attn_test PRIVATE dgpp_kernels CUDA::cudart Threads::Threads)
+dgpp_set_common(full_attn_test)
+add_test(NAME full_attn_test COMMAND full_attn_test)
+add_executable(qwen_full_attn_test tests/cuda/qwen_full_attn_test.cpp)
+target_include_directories(qwen_full_attn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(qwen_full_attn_test PRIVATE dgpp_models_qwen_layers dgpp_models_qwen dgpp_kernels CUDA::cudart Threads::Threads)
+dgpp_set_common(qwen_full_attn_test)
+add_test(NAME qwen_full_attn_test COMMAND qwen_full_attn_test)
+
+# The Qwen3.8-27B forward gate (#84): fixture -> smoke; the python reference
+# end to end (relaxed, the engine's states written) -> the reference
+# teacher-forced on them -> the strict parity.
+add_executable(qwen35_forward_test tests/cuda/qwen35_forward_test.cpp)
+target_include_directories(qwen35_forward_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(qwen35_forward_test PRIVATE dgpp_models_qwen_layers dgpp_models_qwen_loader dgpp_models_qwen dgpp_kernels CUDA::cudart Threads::Threads)
+dgpp_set_common(qwen35_forward_test)
+set(QWEN35_FORWARD_FIXTURE ${CMAKE_CURRENT_BINARY_DIR}/qwen35_forward_fixture)
+add_test(NAME qwen35_forward_fixture COMMAND qwen35_forward_test --write-fixture ${QWEN35_FORWARD_FIXTURE})
+add_test(NAME qwen35_forward_smoke COMMAND qwen35_forward_test --smoke ${QWEN35_FORWARD_FIXTURE})
+set_tests_properties(qwen35_forward_smoke PROPERTIES DEPENDS qwen35_forward_fixture)
+add_test(NAME qwen35_forward_generate
+  COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/qwen35_reference_dump.py
+          gen-pure --checkpoint-dir ${QWEN35_FORWARD_FIXTURE}
+          --out ${CMAKE_CURRENT_BINARY_DIR}/qwen35_pure_ref.q35dump)
+set_tests_properties(qwen35_forward_generate PROPERTIES DEPENDS qwen35_forward_fixture)
+add_test(NAME qwen35_forward_test_e2e
+  COMMAND qwen35_forward_test --checkpoint-dir ${QWEN35_FORWARD_FIXTURE}
+          --dump-file ${CMAKE_CURRENT_BINARY_DIR}/qwen35_pure_ref.q35dump --relaxed
+          --engine-states ${CMAKE_CURRENT_BINARY_DIR}/qwen35_engine_states.bin)
+set_tests_properties(qwen35_forward_test_e2e PROPERTIES DEPENDS qwen35_forward_generate)
+add_test(NAME qwen35_forward_generate_teacher
+  COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/qwen35_reference_dump.py
+          gen-pure --checkpoint-dir ${QWEN35_FORWARD_FIXTURE}
+          --out ${CMAKE_CURRENT_BINARY_DIR}/qwen35_teacher_ref.q35dump
+          --teacher ${CMAKE_CURRENT_BINARY_DIR}/qwen35_engine_states.bin)
+set_tests_properties(qwen35_forward_generate_teacher PROPERTIES DEPENDS qwen35_forward_test_e2e)
+add_test(NAME qwen35_forward_test
+  COMMAND qwen35_forward_test --checkpoint-dir ${QWEN35_FORWARD_FIXTURE}
+          --dump-file ${CMAKE_CURRENT_BINARY_DIR}/qwen35_teacher_ref.q35dump)
+set_tests_properties(qwen35_forward_test PROPERTIES DEPENDS qwen35_forward_generate_teacher)
+# The 27B TP forwards (#86): loopback worlds of 2 and 4 over the tiny
+# fixture against the world-1 forward (ports 29950, 29951).
+add_executable(qwen35_tp_test tests/cuda/qwen35_tp_test.cpp)
+target_include_directories(qwen35_tp_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(qwen35_tp_test PRIVATE dgpp_models_qwen_layers dgpp_models_qwen_loader dgpp_models_qwen dgpp_bus dgpp_loaders dgpp_kernels CUDA::cudart Threads::Threads)
+dgpp_set_common(qwen35_tp_test)
+add_test(NAME qwen35_tp_test COMMAND qwen35_tp_test)
+set_tests_properties(qwen35_tp_test PROPERTIES RUN_SERIAL TRUE LABELS "gpu")
+
+add_executable(qwen35_loader_smoke tests/cuda/qwen35_loader_smoke.cpp)
+target_include_directories(qwen35_loader_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(qwen35_loader_smoke PRIVATE dgpp_models_qwen_loader dgpp_models_qwen dgpp_kernels CUDA::cudart Threads::Threads)
+dgpp_set_common(qwen35_loader_smoke)
 
 add_executable(mimo_attn_test tests/cuda/mimo_attn_test.cu)
 target_include_directories(mimo_attn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
@@ -1676,6 +1741,11 @@ target_include_directories(fp8_gemm_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(fp8_gemm_test PRIVATE dgpp_kernels CUDA::cudart)
 dgpp_set_common(fp8_gemm_test)
 add_test(NAME fp8_gemm_test COMMAND fp8_gemm_test)
+add_executable(fp8w_gemm_test tests/cuda/fp8w_gemm_test.cu)
+target_include_directories(fp8w_gemm_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(fp8w_gemm_test PRIVATE dgpp_kernels CUDA::cudart)
+dgpp_set_common(fp8w_gemm_test)
+add_test(NAME fp8w_gemm_test COMMAND fp8w_gemm_test)
 set_tests_properties(fp8_gemm_test PROPERTIES SKIP_RETURN_CODE 2 LABELS "gpu")
 
 add_executable(scale_gemm_test
@@ -1768,6 +1838,13 @@ set(GLM_FORWARD_FIXTURE ${CMAKE_CURRENT_BINARY_DIR}/glm_forward_fixture)
 add_test(NAME glm_forward_fixture
   COMMAND glm_forward_test --write-fixture ${GLM_FORWARD_FIXTURE})
 set_tests_properties(glm_forward_fixture PROPERTIES SKIP_RETURN_CODE 2)
+add_executable(prefix_snapshot_test tests/cuda/prefix_snapshot_test.cpp)
+target_include_directories(prefix_snapshot_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(prefix_snapshot_test PRIVATE dgpp_models_qwen_layers dgpp_models_glm_loader CUDA::cudart)
+dgpp_set_common(prefix_snapshot_test)
+add_test(NAME prefix_snapshot_test
+  COMMAND prefix_snapshot_test ${QWEN_FORWARD_FIXTURE} ${GLM_FORWARD_FIXTURE})
+set_tests_properties(prefix_snapshot_test PROPERTIES DEPENDS "qwen_forward_fixture;glm_forward_fixture" RUN_SERIAL TRUE)
 add_test(NAME glm_forward_generate
   COMMAND ${Python3_EXECUTABLE}
           ${CMAKE_CURRENT_SOURCE_DIR}/tools/glm_reference_dump.py
@@ -1962,7 +2039,7 @@ set_tests_properties(tokenizer_test qwen_tokenizer_test glm4_tokenizer_test dsv4
   chat_template_test qwen_chat_template_test glm4_chat_template_test dsv41_prompt_test
   dsv4_tokenizer_test dsv4_prompt_test
   PROPERTIES LABELS "host;checkpoint")
-foreach(_test qwen_forward_fixture qwen_forward_generate qwen_dense_forward_fixture glm4_forward_fixture
+foreach(_test qwen_forward_fixture qwen_forward_generate glm4_forward_fixture
     glm4_forward_generate mimo_forward_fixture mimo_forward_generate mimo_forward_generate_teacher
     glm_forward_fixture glm_forward_generate dsa_dump_generate kda_dump_generate)
   set_tests_properties(${_test} PROPERTIES LABELS "fixture")

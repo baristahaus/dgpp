@@ -1,5 +1,15 @@
 # Tests
 
+`prefix_snapshot_test` forces a four-block K/V pool full at snapshot time in
+Qwen and GLM. It covers monolithic and resumable prefill, unchanged target/draft
+logits, full-block pin cleanup, skipped hop replacements, timer/slot reuse, and
+propagation of non-pool errors. Build it with `qwen_forward_test` and
+`glm_forward_test`, then run CTest with
+`-R '^(qwen_forward_fixture|glm_forward_fixture|prefix_snapshot_test)$'`.
+`scheduler_test` also checks that skipped hops never become cache entries,
+including replacements of older snapshots, and that skipped prefill slots and
+the `skipped_no_block` counter are handled correctly.
+
 The long-document prefix-cache regression is covered by `scheduler_test`
 (changed tails, lookahead identity, small arenas and cleanup), `qwen_decode_test`
 and `glm_tp_test` (two snapshots, resumed target/draft logits and budget changes).
@@ -9,6 +19,13 @@ The entry floor and the head cut (2026-09-28) are covered by `scheduler_test`
 `cluster_config_test` (the keys) and `fabric_serve_test` (the journal records).
 The [fabric record](../benchmarks/results/2026-09-21-prefix-document-reuse.md)
 covers real 32K/260K prompts, KV sharing and the recipe memory-plan audit.
+
+`serve_test` covers assistant thinking history with the
+`DGPP_TEST_FILTER=serve_thinkingParts_` cases: mixed visible and reasoning
+parts, redacted/empty thinking, explicit reasoning precedence, tool-call
+history, invalid field types and role restrictions. The UTF-8 case keeps
+heap-backed reasoning alive through later messages and template preparation;
+run these cases under the `asan` preset to check the owned-string lifetime.
 
 Release and testing builds use separate CMake presets and directories:
 

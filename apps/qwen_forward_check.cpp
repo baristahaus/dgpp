@@ -98,10 +98,7 @@ int main(int argc, char** argv) {
     if (!ngram_table.empty()) dgpp::QwenLayerStream::set_ngram_table_mmap(ngram_table == "mmap");
     if (!ngram_table_dir.empty()) dgpp::QwenLayerStream::set_ngram_table_dir(ngram_table_dir);
     if (cfg.dense_fp8_shipped) dgpp::QwenLayerStream::set_dense_weights_fp8(true);  // the hybrid ships fp8
-    if (!dense_weights.empty()) {  // checkpoint | fp8 | nvfp4 (docs/qwen38_dual_spark.md)
-      dgpp::QwenLayerStream::set_dense_weights_fp8(dense_weights == "fp8" || dense_weights == "nvfp4");
-      dgpp::QwenLayerStream::set_dense_mlp_nvfp4(dense_weights == "nvfp4");
-    }
+    if (!dense_weights.empty()) dgpp::QwenLayerStream::set_dense_weights_fp8(dense_weights == "fp8");
     if (!mtp_expert_format.empty()) dgpp::QwenLayerStream::set_mtp_expert_format(mtp_expert_format == "bf16_fused");
     cfg.mtp_experts_bf16_fused = dgpp::QwenLayerStream::mtp_experts_bf16_fused();
     const dgpp::QwenResidency residency = resident ? dgpp::QwenResidency::Resident : dgpp::QwenResidency::Streaming;

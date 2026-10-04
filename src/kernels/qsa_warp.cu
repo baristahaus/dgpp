@@ -70,8 +70,7 @@ __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
     const uint16_t* __restrict__ q, int64_t q_row_stride, const uint16_t* __restrict__ k_cache,
     const uint16_t* __restrict__ v_cache, const int32_t* __restrict__ req_ids, const int32_t* __restrict__ topk,
     int topk_stride, const int32_t* __restrict__ counts, int local_heads, int kv_heads, int block_tokens,
-    const int32_t* __restrict__ block_tables, int blocks_per_request, float scale, float* __restrict__ out,
-    bool contiguous) {
+    const int32_t* __restrict__ block_tables, int blocks_per_request, float scale, float* __restrict__ out) {
   extern __shared__ __align__(16) uint16_t sm[];
   const int64_t r = blockIdx.x;
   const int kvh = blockIdx.y;
@@ -109,7 +108,7 @@ __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
     // (a serial token -> block-table chain per issue step starved the copies).
     int64_t my_off = 0;
     if (lane < kTileTok && base + lane < cnt) {
-      const int64_t tok = contiguous ? base + lane : toks[base + lane];
+      const int tok = toks[base + lane];
       const int64_t phys = static_cast<int64_t>(bt[tok / block_tokens]) * block_tokens + tok % block_tokens;
       my_off = phys * width + static_cast<int64_t>(kvh) * kD;
     }
@@ -233,7 +232,7 @@ void qsa_attn_prefill_warp(const uint16_t* q, int64_t q_row_stride, const uint16
                            const uint16_t* v_cache, const int32_t* req_ids, const int32_t* topk, int topk_stride,
                            const int32_t* counts, int rows, int local_heads, int kv_heads, int block_tokens,
                            const int32_t* block_tables, int blocks_per_request, float scale, float* out,
-                           cudaStream_t stream, bool contiguous) {
+                           cudaStream_t stream) {
   if (rows <= 0) return;
   if (!qsa_warp_supported(kD, local_heads, kv_heads))
     throw std::invalid_argument("qsa_attn_prefill_warp: dim 256, <= 16 query heads per KV head");
@@ -246,12 +245,11 @@ void qsa_attn_prefill_warp(const uint16_t* q, int64_t q_row_stride, const uint16
     return true;
   }();
   (void)opted;
-  (void)topk; (void)topk_stride;  // read only in the listed form
   const dim3 grid(static_cast<unsigned>(rows), static_cast<unsigned>(kv_heads));
   qsa_attn_prefill_warp_kernel<<<grid, 32, kSmem, stream>>>(q, q_row_stride, k_cache, v_cache, req_ids, topk,
                                                               topk_stride, counts, local_heads, kv_heads,
                                                               block_tokens, block_tables, blocks_per_request,
-                                                              scale, out, contiguous);
+                                                              scale, out);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 

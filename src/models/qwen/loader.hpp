@@ -92,6 +92,22 @@ struct QwenQsaResident {
   int kv_head_begin = 0;    // first global kv head
 };
 
+// Qwen3.5 full-attention layers: plain GQA (no indexer). Same q/k/v/o +
+// q/k norms as QSA, the [q | gate] interleave, dense causal attention.
+struct QwenFullAttnResident {
+  const uint16_t* q_proj = nullptr;  // BF16 [lh * 2 * d, hidden]
+  const uint16_t* k_proj = nullptr;  // BF16 [lkv * d, hidden]
+  const uint16_t* v_proj = nullptr;  // BF16 [lkv * d, hidden]
+  const uint16_t* o_proj = nullptr;  // BF16 [hidden, lh * d] (packed columns)
+  const uint16_t* q_norm = nullptr;  // BF16 [d]
+  const uint16_t* k_norm = nullptr;  // BF16 [d]
+  GlmQuantMatrix q_proj_fp8, k_proj_fp8, v_proj_fp8, o_proj_fp8;  // dense_weights fp8
+  int local_heads = 0;      // query heads on this rank
+  int head_begin = 0;       // first global query head
+  int local_kv_heads = 0;   // kv heads on this rank
+  int kv_head_begin = 0;    // first global kv head
+};
+
 struct QwenMoeResident {
   const uint16_t* router = nullptr;       // BF16 [E, hidden]
   const uint16_t* shared_gate = nullptr;  // BF16 [1, hidden]
@@ -132,33 +148,15 @@ struct QwenPleResident {
   int64_t rows = 0;
 };
 
-// The dense form's SwiGLU MLP (the Qwen3.8-27B, docs/qwen38_27b_dense_plan.md
-// §2): gate/up sliced by intermediate rows, down by intermediate columns —
-// the shared expert's shapes at the full 17408 width.
-struct QwenMlpResident {
-  const uint16_t* gate = nullptr;  // BF16 [I/W, hidden]
-  const uint16_t* up = nullptr;    // BF16 [I/W, hidden]
-  const uint16_t* down = nullptr;  // BF16 [hidden, I/W] (packed columns)
-  GlmQuantMatrix fp8[3];           // dense_weights fp8: the same three
-  GlmFp4Matrix fp4[3];             // dense_weights nvfp4: the same three (the rest stays fp8)
-  int64_t local_inter = 0;         // I/W
-};
-
 struct QwenLayerResident {
   int layer = -1;
   QwenLayerKind kind = QwenLayerKind::Gdn;
   bool has_ple = false;
   QwenGrResident attn_gr;
   QwenGrResident mlp_gr;
-  // The plain-residual form (the dense 27B): the per-site LayerNorm pair
-  // stands in for the gated-residual sites; the walk's residual stream is
-  // the hidden itself (hyper_width() == hidden_size).
-  const uint16_t* ln_in = nullptr;    // BF16 [hidden] (input_layernorm)
-  const uint16_t* ln_post = nullptr;  // BF16 [hidden] (post_attention_layernorm)
   QwenGdnResident gdn;  // GDN layers
   QwenQsaResident qsa;  // QSA layers (the draft layer too)
   QwenMoeResident moe;
-  QwenMlpResident mlp;  // the dense form's SwiGLU
   QwenPleResident ple;  // the PLE layer only
   size_t bytes = 0;
 };
@@ -176,10 +174,6 @@ struct QwenGlobalsResident {
   int lm_vocab_begin = 0;
   int lm_vocab_count = 0;
   QwenGrResident mixer;               // the final read (no inject)
-  // The plain-residual form (the dense 27B): the final norm stands in for
-  // the mixer, and the draft carries its own.
-  const uint16_t* final_norm = nullptr;  // BF16 [hidden] (model...norm.weight)
-  const uint16_t* mtp_norm = nullptr;    // BF16 [hidden] (mtp.norm.weight)
   // The draft head (when the draft layer exists).
   const uint16_t* mtp_fc_embedding = nullptr;         // BF16 [hidden, hidden]
   const uint16_t* mtp_fc_hidden = nullptr;            // BF16 [hidden, hidden]
@@ -330,16 +324,6 @@ class QwenLayerStream : public ResidentLayerStream<QwenLoaderFamily> {
   // stream is built; the memory plan and the resident image key follow it.
   static void set_dense_weights_fp8(bool on);
   static bool dense_weights_fp8();
-  // The dense MLP's at-load NVFP4 form (2026-10-03, engine.dense_weights =
-  // "nvfp4", docs/qwen38_dual_spark.md): every dense SwiGLU (the dense
-  // 27B's and the draft layer's) encoded to the modelopt NVFP4 triple —
-  // 4.9 GB a rank at world 2, the difference between fitting a 16 GB
-  // board and not — while every other dense projection keeps the block-FP8
-  // form (requires set_dense_weights_fp8). The BF16 releases only: a
-  // shipped-FP8 checkpoint keeps its form. Set before the stream is
-  // built; the memory plan and the resident image key follow it.
-  static void set_dense_mlp_nvfp4(bool on);
-  static bool dense_mlp_nvfp4();
   // The opt-in fp8 prefill GEMM (2026-09-30, engine.prefill_fp8_gemm; NOT
   // bitwise): a prefill-shaped dense product under dense_weights = fp8
   // runs on the fp8 tensor cores (kernels/fp8_gemm: per-token 1 x 128

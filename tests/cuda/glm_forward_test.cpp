@@ -196,7 +196,7 @@ DGPP_TEST(glm_embed_bcast_streams_copies_all_four) {
   std::memcpy(d_ids, ids.data(), ids.size() * 8);
   cudaStream_t s;
   DGPP_CUDA_OK(cudaStreamCreate(&s));
-  dgpp::glm_embed_bcast_streams(d_table, d_ids, d_streams, tokens, hidden, 4, s);
+  dgpp::glm_embed_bcast_streams(d_table, d_ids, d_streams, tokens, hidden, s);
   DGPP_CUDA_OK(cudaStreamSynchronize(s));
 
   for (int t = 0; t < tokens; ++t)

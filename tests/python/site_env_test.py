@@ -118,6 +118,20 @@ class SiteEnvTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, " ".join(resolved["nodes"]) + "\n" + " ".join(resolved["nodes"][1:]) + "\n")
 
+    def test_repeated_host_names_stack_ranks_on_one_machine(self):
+        # A host listed N times hosts N ranks (this node: two GPUs, one
+        # machine). A bare override entry applies to every rank on the
+        # host, a rank-suffixed key (host#1) to its second rank only.
+        self.assertEqual(len(site_env.node_environments(self.values(DGPP_NODES="head head"))), 2)
+        first, second = site_env.node_environments(
+            self.values(DGPP_NODES="head head",
+                        DGPP_NODE_OVERRIDES=json.dumps(
+                            {"head": {"DGPP_LOG_LEVEL": "debug"}, "head#1": {"CUDA_VISIBLE_DEVICES": "1"}})))
+        self.assertEqual(first["DGPP_LOG_LEVEL"], "debug")
+        self.assertNotIn("CUDA_VISIBLE_DEVICES", first)
+        self.assertEqual(second["DGPP_LOG_LEVEL"], "debug")
+        self.assertEqual(second["CUDA_VISIBLE_DEVICES"], "1")
+
     def test_resolved_config_keeps_model_settings_and_excludes_env(self):
         original = self.config.read_text()
         resolved = site_env.resolve_config(self.config, self.values())
@@ -178,7 +192,7 @@ class SiteEnvTest(unittest.TestCase):
 
     def test_invalid_values_fail(self):
         cases = [
-            {"DGPP_NODES": "head head"}, {"DGPP_NODES": "head;command peer"},
+            {"DGPP_NODES": "head;command peer"},
             {"DGPP_SSH_USER": "-oProxyCommand=bad"}, {"DGPP_HTTP_PORT": "65536"},
             {"DGPP_HTTP_PORT": "1.5"}, {"DGPP_FABRIC_PORT": "29971"},
             {"DGPP_STAGE_DIR": "/"}, {"DGPP_STAGE_DIR": "/tmp/../"},

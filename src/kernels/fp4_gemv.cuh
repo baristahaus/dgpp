@@ -35,9 +35,8 @@
 // per-code cost is the bit placement, one f16 -> f32 conversion and the
 // multiply — no fp16 arithmetic anywhere.
 //
-// CONTRACT: K a multiple of 32 with at most 20 chunks per lane — four
-// passes of four plus the fifth (K <= 20480; the compiled set is
-// dispatch_k's); payload rows 16-byte aligned.
+// CONTRACT: K a multiple of 32 with at most 16 chunks per lane (K <=
+// 16384; the compiled set is dispatch_k's); payload rows 16-byte aligned.
 // Scales are e4m3 bytes [n, K/16] row-major; NaN scale codes (0x7F/0xFF)
 // propagate as NaN.
 //
@@ -88,12 +87,8 @@ __host__ __device__ constexpr int scale_cols_of(int k, int group) { return k / g
 // (warp_row_dots_pair: gate and up issued together). A row's chain is the
 // same whatever the step count, so the outputs are bitwise across it.
 constexpr int kSteps = 1;                         // row steps per warp
-// 5: K = 8704 (the dense 27B's MLP down at world 2, docs/qwen38_dual_spark.md)
-// is 272 chunks — 16 lanes x 17 — one over four passes of four; the fifth
-// pass is a loop bound only (Geom<K>::passes derives per K, the assert
-// aside), so the existing widths' geometry is untouched.
-constexpr int kMaxPasses = 5;                     // chunk passes per lane
-constexpr int kMaxK = kCodesPerChunk * 32 * kMaxChunksPerLane * kMaxPasses;  // 20480
+constexpr int kMaxPasses = 4;                     // chunk passes per lane
+constexpr int kMaxK = kCodesPerChunk * 32 * kMaxChunksPerLane * kMaxPasses;  // 16384
 
 // The row geometry as a function of K = 32 x row_chunks (2026-09-09,
 // docs/glm47_plan.md D2 — GLM-4.7's 5120 / 384 / 3072 widths): the
@@ -711,11 +706,7 @@ __device__ __forceinline__ void block_rows(const uint8_t* __restrict__ w,
 // 1536 (the expert down at worlds 4 / 2 / 1), 3072 / 6144 / 12288 (the
 // dense down at worlds 4 / 2 / 1). Qwen3.8-Flash-Next's NVFP4 experts
 //: 2560 (hidden: gate/up), 640 / 320 / 160 (the expert down
-// at worlds 1 / 2 / 4). The dense Qwen3.8-27B's at-load NVFP4 MLPs
-// (docs/qwen38_dual_spark.md): 8704 — the down's K at world 2 (its
-// gate/up share Flash-Next's 5120 hidden). World 1's 17408 would fit the
-// fifth pass too but is not compiled — the dual-spark form targets world 2
-// and world 1 keeps the fp8 MLP.
+// at worlds 1 / 2 / 4).
 template <typename F>
 __host__ inline void dispatch_k(int k, F&& f) {
   switch (k) {
@@ -737,12 +728,11 @@ __host__ inline void dispatch_k(int k, F&& f) {
     case 4096: f(std::integral_constant<int, 4096>{}); return;
     case 5120: f(std::integral_constant<int, 5120>{}); return;
     case 6144: f(std::integral_constant<int, 6144>{}); return;
-    case 8704: f(std::integral_constant<int, 8704>{}); return;
     case 12288: f(std::integral_constant<int, 12288>{}); return;
     default:
       throw std::invalid_argument(
           "fp4_gemv: K is not in the compiled set (32..4096 powers of two, "
-          "160, 320, 384, 640, 768, 1536, 2560, 3072, 5120, 6144, 8704, 12288)");
+          "160, 320, 384, 640, 768, 1536, 2560, 3072, 5120, 6144, 12288)");
   }
 }
 // The MXFP4 compiled set (2026-09-13): DeepSeek-V4.1-Flash's widths —
@@ -777,12 +767,11 @@ __host__ __device__ constexpr bool k_compiled_mx(int k) {
   return k == 32 || k == 64 || k == 128 || k == 256 || k == 512 || k == 576 || k == 1024 ||
          k == 1152 || k == 2048 || k == 2304 || k == 4096 || k == 5120;
 }
-// True when dispatch_k compiles a kernel for k. 8704: the dense 27B's
-// down_proj K at world 2 (docs/qwen38_dual_spark.md).
+// True when dispatch_k compiles a kernel for k.
 __host__ __device__ constexpr bool k_compiled(int k) {
   return k == 32 || k == 64 || k == 128 || k == 160 || k == 256 || k == 320 || k == 384 ||
          k == 512 || k == 640 || k == 768 || k == 1024 || k == 1536 || k == 2048 || k == 2560 ||
-         k == 3072 || k == 4096 || k == 5120 || k == 6144 || k == 8704 || k == 12288;
+         k == 3072 || k == 4096 || k == 5120 || k == 6144 || k == 12288;
 }
 // The compiled check for either group.
 __host__ __device__ constexpr bool k_compiled_for(int k, int group) {

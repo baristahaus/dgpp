@@ -105,28 +105,12 @@ void expect_qsa(TensorList& out, const std::string& p, const QwenTextConfig& cfg
   add_dense(out, p + "o_proj.weight", H, qh * d, c, layer, cfg);
   add_bf16(out, p + "q_norm.weight", {d}, c, layer);
   add_bf16(out, p + "k_norm.weight", {d}, c, layer);
-  // The indexer belongs to the indexed (qwen4_exp) form; the dense 27B's
-  // attention selects all pools and ships no indexer tensors.
-  if (!cfg.has_indexer()) return;
   const int64_t id = cfg.indexer_head_dim;
   add_bf16(out, p + "indexer.index_qk_proj.weight",
            {(cfg.indexer_n_heads + cfg.indexer_kv_heads) * id, H}, QwenWeightClass::QsaIndexer,
            layer);
   add_bf16(out, p + "indexer.q_layernorm.weight", {id}, QwenWeightClass::QsaIndexer, layer);
   add_bf16(out, p + "indexer.k_layernorm.weight", {id}, QwenWeightClass::QsaIndexer, layer);
-}
-
-// The dense form's SwiGLU MLP: gate/up [I, H], down [H, I]. The same
-// projection the routed layers' shared expert uses, at the full MLP width
-// — the Qwen3.8-27B ships it BF16 (add_dense covers a hypothetical hybrid).
-void expect_dense_mlp(TensorList& out, const std::string& p, const QwenTextConfig& cfg,
-                      int layer) {
-  const int64_t H = cfg.hidden_size;
-  const int64_t I = cfg.intermediate_size;
-  const QwenWeightClass c = QwenWeightClass::DenseMlp;
-  add_dense(out, p + "gate_proj.weight", I, H, c, layer, cfg);
-  add_dense(out, p + "up_proj.weight", I, H, c, layer, cfg);
-  add_dense(out, p + "down_proj.weight", H, I, c, layer, cfg);
 }
 
 void expect_moe(TensorList& out, const std::string& p, const QwenTextConfig& cfg, int layer) {
@@ -232,26 +216,13 @@ std::vector<QwenExpectedTensor> qwen_expected_layer_tensors(const QwenTextConfig
   const std::string p = qwen_layer_prefix(cfg, layer);
   TensorList out;
   if (!is_mtp && layer == cfg.ple_layer()) expect_ple(out, p + "ple.", cfg, layer);
-  // The plain-residual form (the dense 27B) carries the Qwen LayerNorm pair
-  // around each site — the GR form composes the residual stream through the
-  // hc_norm'd mixers instead, and ships no per-layer norms.
-  if (!cfg.has_gr()) {
-    add_bf16(out, p + "input_layernorm.weight", {cfg.hidden_size}, QwenWeightClass::Norm, layer);
-    add_bf16(out, p + "post_attention_layernorm.weight", {cfg.hidden_size},
-             QwenWeightClass::Norm, layer);
-  }
-  if (cfg.has_gr())
-    expect_gr(out, p + "attn_hyper_connection.", cfg, layer, QwenWeightClass::Gr, true);
+  expect_gr(out, p + "attn_hyper_connection.", cfg, layer, QwenWeightClass::Gr, true);
   if (kind == QwenLayerKind::Gdn)
     expect_gdn(out, p + "linear_attn.", cfg, layer);
   else
     expect_qsa(out, p + "self_attn.", cfg, layer);
-  if (cfg.has_gr())
-    expect_gr(out, p + "mlp_hyper_connection.", cfg, layer, QwenWeightClass::Gr, true);
-  if (cfg.has_moe())
-    expect_moe(out, p + "mlp.", cfg, layer);
-  else
-    expect_dense_mlp(out, p + "mlp.", cfg, layer);
+  expect_gr(out, p + "mlp_hyper_connection.", cfg, layer, QwenWeightClass::Gr, true);
+  expect_moe(out, p + "mlp.", cfg, layer);
   return out;
 }
 
@@ -264,33 +235,16 @@ std::vector<QwenExpectedTensor> qwen_expected_global_tensors(const QwenTextConfi
     add_gptq(out, "lm_head", cfg.vocab_size, H, 8, cfg.gptq_group, QwenWeightClass::LmHead, -1, -1);
   else
     add_bf16(out, "lm_head.weight", {cfg.vocab_size, H}, QwenWeightClass::LmHead, -1);
-  // The plain-residual form carries the model's final RMSNorm itself; the
-  // GR form folds the final mix into the model-level mixer instead.
-  if (!cfg.has_gr())
-    add_bf16(out, "model.language_model.norm.weight", {H}, QwenWeightClass::Norm, -1);
-  if (cfg.has_gr())
-    expect_gr(out, "model.language_model.hyper_connection_mixer.", cfg, -1,
-              QwenWeightClass::Mixer, false);
+  expect_gr(out, "model.language_model.hyper_connection_mixer.", cfg, -1, QwenWeightClass::Mixer,
+            false);
   if (cfg.mtp_layer() >= 0) {
-    if (cfg.has_gr()) {
-      add_bf16(out, "mtp.fc_embedding.weight", {H, H}, QwenWeightClass::Mtp, cfg.mtp_layer());
-      add_bf16(out, "mtp.fc_hidden.weight", {H, H}, QwenWeightClass::Mtp, cfg.mtp_layer());
-      add_bf16(out, "mtp.pre_fc_norm_embedding.weight", {H}, QwenWeightClass::Mtp, cfg.mtp_layer());
-      add_bf16(out, "mtp.pre_fc_norm_hidden.weight", {cfg.hyper_width()}, QwenWeightClass::Mtp,
-               cfg.mtp_layer());
-      expect_gr(out, "mtp.hyper_connection_mixer.", cfg, cfg.mtp_layer(), QwenWeightClass::Mtp,
-                false);
-    } else {
-      // The dense 27B draft: one fused fc over concat(embedding, hidden)
-      // [H, 2H] — mtp_use_dedicated_embeddings is false, so the embedding
-      // row is gathered live — the pre-fc norms over each H-wide stream,
-      // and the draft stream's own final norm. No mixer: the draft carries
-      // the plain residual like the trunk.
-      add_bf16(out, "mtp.fc.weight", {H, 2 * H}, QwenWeightClass::Mtp, cfg.mtp_layer());
-      add_bf16(out, "mtp.pre_fc_norm_embedding.weight", {H}, QwenWeightClass::Mtp, cfg.mtp_layer());
-      add_bf16(out, "mtp.pre_fc_norm_hidden.weight", {H}, QwenWeightClass::Mtp, cfg.mtp_layer());
-      add_bf16(out, "mtp.norm.weight", {H}, QwenWeightClass::Mtp, cfg.mtp_layer());
-    }
+    add_bf16(out, "mtp.fc_embedding.weight", {H, H}, QwenWeightClass::Mtp, cfg.mtp_layer());
+    add_bf16(out, "mtp.fc_hidden.weight", {H, H}, QwenWeightClass::Mtp, cfg.mtp_layer());
+    add_bf16(out, "mtp.pre_fc_norm_embedding.weight", {H}, QwenWeightClass::Mtp, cfg.mtp_layer());
+    add_bf16(out, "mtp.pre_fc_norm_hidden.weight", {cfg.hyper_width()}, QwenWeightClass::Mtp,
+             cfg.mtp_layer());
+    expect_gr(out, "mtp.hyper_connection_mixer.", cfg, cfg.mtp_layer(), QwenWeightClass::Mtp,
+              false);
   }
   return out;
 }
@@ -386,15 +340,9 @@ void qwen_tp_validate_geometry(const QwenTextConfig& cfg, int rank, int world) {
     fail("query heads per kv head");
   if (!cfg.ple_layer_ids.empty() && cfg.ngram_geometry().heads % world != 0)
     fail("the n-gram hash heads must divide by world");
-  if (cfg.has_moe()) {
-    for (const int inter : {cfg.moe_intermediate_size, cfg.shared_expert_intermediate_size}) {
-      if (inter % world != 0) fail("an expert intermediate size must divide by world");
-      if ((inter / world) % 16 != 0) fail("an expert intermediate slice must be a multiple of 16");
-    }
-  } else {
-    if (cfg.intermediate_size % world != 0) fail("intermediate_size must divide by world");
-    if ((cfg.intermediate_size / world) % 16 != 0)
-      fail("the MLP intermediate slice must be a multiple of 16");
+  for (const int inter : {cfg.moe_intermediate_size, cfg.shared_expert_intermediate_size}) {
+    if (inter % world != 0) fail("an expert intermediate size must divide by world");
+    if ((inter / world) % 16 != 0) fail("an expert intermediate slice must be a multiple of 16");
   }
 }
 

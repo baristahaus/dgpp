@@ -116,9 +116,17 @@ struct ClusterConfig {
     //     checkpoint's 128 x 128 weight scales, fp32 promotion per group —
     //     the reference stack's cutlass blockwise GEMM) instead of the
     //     dequantized bf16 GEMM. Requires engine.dense_weights = fp8.
+    //   prefill_fp8_per_tensor: the Qwen3.8-27B prefill recipe — every FP8
+    //     projection's prefill GEMM (rows above the decode GEMV band, and
+    //     every resumed chunk) on cuBLASLt's per-tensor-scale e4m3 kernels
+    //     from boot-requantized per-tensor weights and per-call per-tensor
+    //     activations: ~2x the dequantized bf16 GEMM's rate, +23 GiB
+    //     resident at the 27B's shape, and not transcript-preserving at
+    //     long context. Default: the dequantized bf16 GEMM (exact).
     bool prefill_bf16_partials = false;
     bool prefill_fold_scales = false;
     bool prefill_fp8_gemm = false;
+    bool prefill_fp8_per_tensor = false;
     // The packed expert GEMM's form and companions (2026-09-30; every
     // serving switch is a config key — no environment variable selects a
     // kernel). All bitwise the default chain.
@@ -167,6 +175,18 @@ struct ClusterConfig {
     bool mtp = false;
     int mtp_depth = 1;             // draft tokens per step (1..5); needs mtp
     bool mtp_depth_set = false;    // the file named it (else a family may default it: DSpark's block is 5)
+    // The DFlash2 block drafter (Qwen3.5-family, eager path only): a
+    // checkpoint directory or HF id whose config.json names the drafter.
+    // Replaces mtp (mutually exclusive); the draft width is the
+    // checkpoint's block_size - 1.
+    std::string dflash_model = "";
+    // Its serving options: the multi-slot verify replayed as a captured
+    // graph (the measured best), the redrafts stacked across slots, and a
+    // verify-depth cap (0 = the whole block; transcripts are exact at any
+    // value — unverified drafts re-draft next step).
+    bool dflash_verify_graph = true;
+    bool dflash_draft_batch = true;
+    int dflash_depth = 0;
     // The confidence-scheduled verify depth (engine/verify_schedule.hpp,
     // 2026-09-14; needs mtp and a family with a confidence head — DSpark):
     // a step verifies only the leading drafts whose prefix survival beats

@@ -6,6 +6,99 @@ The history by milestone. The dated engineering record in
 
 ## Unreleased
 
+- **Qwen3.8-27B: the review's follow-ups** (2026-10-03, #84 / #85 / #87):
+  the full-attention layers' kernels rewritten (`kernels/full_attn`: a
+  query-tiled prefill form — sixteen queries by one head a warp over
+  32-token K/V tiles — and a split-KV decode walk with a combine pass; 30K
+  decode 187 → 146 ms a step, the 2K prefill's attention 87.5 → 29.9 ms,
+  the 30K prefill 40.9 → 29.2 s, transcripts unchanged); the family's
+  forward fixture gate (`qwen35_forward_test` over a tiny synthetic block-FP8
+  checkpoint from the binding table, `tools/qwen35_reference_dump.py`'s
+  numpy reference of the GDN / full-attention / MLP stack and the draft
+  block, the smoke → end-to-end → teacher-forced strict chain, the MiMo
+  gate's budgets); and the exact prefill measured against its floor — the
+  dequant bridge stays (its dequant runs at line rate and cuBLASLt at the
+  bf16 pipe's rate; a side-stream dequant never overlaps nvjet's persistent
+  grid, and a fused fp8-weight GEMM lands at parity because the decode's
+  instructions share the mma pipe's issue slots), with `kernels/fp8w_gemm`
+  (63–66 TF, both scale forms, `fp8w_gemm_test`) kept for the scale GEMM's
+  26 TF tile route (#89) and `fp8_gemm_bench --27b` reporting every lever.
+  `engine.bf16_weights: bf12` now packs this family's bf16 decode matrices
+  too (#88: the drafter's five layers and fc taps, the MTP fc, a bf16 lm
+  head), the bf16 bytes staying resident for the stacked redrafts' mma form.
+  The family serves on two and four Sparks (#86): the loader's TP geometry
+  (GDN and attention heads, the MLP and the lm head sliced across the ranks,
+  the kv heads paired at world 4) through `Qwen35Model`, two boundary folds
+  a layer (the attention / GDN output and the MLP output, bf16 on the wire)
+  in the main and draft walks, the drafter at world 1 only; the loopback TP
+  gate (`qwen35_tp_test`, worlds 2 and 4 against the world-1 forward over the
+  fixture) and the `cluster_qwen3.8-27b_fp8_w2` template.
+
+- **The DFlash2 block drafter on Qwen3.8-27B** (2026-10-02, #80):
+  `engine.dflash_model` serves `z-lab/Qwen3.8-27B-DFlash2` in place of the
+  MTP draft on the eager world-1 engine — five bidirectional draft layers
+  fed by target taps `[5, 19, 33, 47, 61]` through the split `fc`, 2-tap
+  dynamic grouped convolutions, the rank-256 top-16 selector walk, the
+  shared embedding and lm head, the drafter's K/V in five extra planes of
+  the main pool (kernels/dflash2, models/qwen/dflash2, the `dflash2_*`
+  methods of `Qwen35Model`, `DFlash2Speculator`). Every speculating slot's
+  verify rows ride one physical pass; the multi-slot verify replays as a
+  captured graph (`engine.dflash_verify_graph`), the redrafts stack across
+  slots (`engine.dflash_draft_batch`), and `engine.dflash_depth` caps the
+  verified width (exact at any value). `kSpecRows` 6 → 8 for the 8-row
+  block (the MTP families' `mtp_depth` stays 1–5). The step returns the
+  tokens it decided (the accepted drafts and the verify's next token) like
+  the plain step, so transcripts equal a plain world's of the same verify
+  width (4/4 identical to MTP depth 4); the selector's
+  unary term is the candidate's logit (vLLM `_score_edges`), which makes
+  the walk the proposal rule (+2–11 % tokens per step over a per-slot
+  top-1). The 27B family's own GEMM instance takes the streaming mma form
+  for 17..128-row decode batches (the drafter's weights read once per
+  step); other families' dispatch is unchanged. Template
+  `deploy/cluster_qwen3.8-27b_fp8_w1_dflash2.example.json`; references in
+  `dflash2_kernels_test`, the host contract in `dflash2_speculator_test`,
+  the config gates in `unit_tests`. Measured on one GB10 (greedy, exact
+  numerics): 164 ms/step at C1 for 2.5–6.4 tokens per step by class —
+  the author's bench 22–36 tok/s against MTP depth 2's 13.6–16.4; C4
+  41–84 tok/s wall. Thanks to AhmmedSamier for the lane.
+
+- **Serve Qwen3.8-27B-FP8 on the native engine, with MTP** (2026-10-01,
+  #79): a new family, `qwen3_5` — the 27B dense model, 64 layers of
+  Gated-Delta-Net (48, swish output gate) and full attention (16, GQA with
+  the partial rotary and the per-head output gate) — served from its native
+  blockwise-FP8 checkpoint `Qwen/Qwen3.8-27B-FP8` on one Spark. The
+  streaming loader (`loader35`) reads the GDN in_proj (qkv/z) + out and
+  the full-attention q/k/v/o projections and the dense gate/up/down MLPs
+  as blockwise FP8 (E4M3 + 128×128 scales, widened to F32 at load), keeps
+  the norms BF16, and loads the MTP draft layer onto the last full-attention
+  slot; `Qwen35Model` runs the shared session core (paged K/V over the
+  full-attention layers, model-owned GDN state per slot, the speculative
+  verify/rollback, the decode graphs). MTP (`engine.mtp`, depth 2 in the
+  template) drafts on the MTP head and verifies on the greedy path, so
+  transcripts equal the plain world's. Numerics are the checkpoint's by
+  default (block-scaled FP8 GEMV / streaming MMA at decode rows, the
+  dequantized bf16 GEMM at prefill, the BF16 lm head); two opt-in keys
+  trade exactness for speed and change greedy output —
+  `engine.dense_weights: "fp8"` (the lm head requantized to block FP8; the
+  templates ship it: −19 ms per MTP pass at the same acceptance and eval) and
+  `engine.prefill_fp8_per_tensor` (prefill GEMMs on cuBLASLt's per-tensor
+  e4m3 kernels, ~2x the prefill rate, +23 GiB). One template,
+  `deploy/cluster_qwen3.8-27b_fp8_w1.example.json`; kernel references in
+  `qwen_full_attn_test` / `full_attn_test` / `qwen_norm_test`, the config
+  and binding gates in `unit_tests`. Measured on one GB10 (greedy, the
+  exact defaults): T=1 119 ms/step (the byte floor is 105), MTP depth 2
+  151 ms/pass at 2.1–2.9 tokens per pass, T=1 and MTP transcripts
+  identical; with both FP8 levers 132 ms/pass. The dense MLP's k=17408
+  down projection runs the streaming mma form at every row count (the
+  GEMV's 48 KiB staging holds one row of it, so a 3-row pass read it three
+  times: 74 ms of a 180 ms step). Thanks to AhmmedSamier for the port.
+
+- **Assistant thinking history through LiteLLM** (2026-10-03): accept
+  Anthropic-style assistant thinking parts by folding their text into
+  `reasoning_content`, preserving explicit reasoning strings and dropping
+  redacted payloads. Thinking-only content becomes an empty string, including
+  in tool-call history. Regression tests cover UTF-8 ownership, precedence,
+  empty/redacted parts and invalid fields/roles. Fixes #74 via #76.
 - **Serve DeepSeek-V4-Flash** (2026-10-01): the seventh family,
   `deepseek_v4` (`deepseek-ai/DeepSeek-V4-Flash-0731` as shipped: MXFP4
   routed experts, FP8 block-128 attention projections and shared expert,

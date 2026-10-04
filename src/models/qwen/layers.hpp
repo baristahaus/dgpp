@@ -65,14 +65,34 @@ void qwen_mtp_hidden_projection(const QwenGemmWorkspace& gemm, const uint16_t* a
     const uint16_t* weight, uint16_t* out, int tokens, int hc, int hidden,
     bool decode, cudaStream_t stream);
 
+// Per-tensor FP8 prefill recipe (engine.prefill_fp8_per_tensor, qwen35 Resident only):
+// one layer's x-side projections (all [xrows[i], H] off the same [M, H]
+// input) plus the single output projection [H, ocols]. Every address is
+// boot-fixed, so the branch replays under CUDA graphs; disabled views keep
+// the bridge path. The model sets the view on every bind (rebind included).
+struct QwenPtAttnView {
+  bool enabled = false;
+  int H = 0;
+  int x_count = 0;                // x-side projections sharing this input
+  const uint8_t* xw[4] = {};      // E4M3 [xrows[i], H]
+  const float* xscales = nullptr;  // one boot-fixed F32 scale per x-side proj
+  int xrows[4] = {};
+  const uint8_t* ow = nullptr;    // E4M3 [H, ocols]
+  const float* oscale = nullptr;  // one boot-fixed F32 scale
+  int ocols = 0;
+  uint8_t* act = nullptr;         // shared E4M3 scratch (the model's pt_act_)
+  float* act_scale = nullptr;     // shared scale cell (the model's pt_act_scales_)
+};
+
 // ---- the gated residual --------------------------------------------------------
-// The walk's residual-stream sites (docs/qwen38_27b_dense_plan.md §3): the
-// gated-residual form (QwenGrSite) and the plain-residual form (QwenPlainSite)
-// behind one interface — mix(R -> x), combine(R += y) and its deferred form.
-// The walk composes sites without knowing which form a family runs.
-class QwenGrSite;
-class QwenResidualSite {
+class QwenGrSite {
  public:
+  QwenGrSite(const QwenGrResident& w, const QwenGemmWorkspace& gemm, int hc, int hidden,
+             int lowrank, int max_tokens, float eps);
+  ~QwenGrSite();
+  QwenGrSite(const QwenGrSite&) = delete;
+  QwenGrSite& operator=(const QwenGrSite&) = delete;
+  void rebind(const QwenGrResident& w) { w_ = w; }
   // A combine left for the next site's mix to apply while its group norm
   // reads R (kernels/qwen_gr combine_norm, 2026-09-29): the branch output
   // y [T, H] and the site's gates [T, hc]. Null y: nothing pending.
@@ -81,42 +101,19 @@ class QwenResidualSite {
     const float* gates = nullptr;
     int hc = 0;
   };
-  virtual ~QwenResidualSite() = default;
-  // x[T, H] from R[T, W]. `pending`: the previous site's combine applied
-  // first.
-  virtual void mix(uint16_t* r, uint16_t* x, int tokens, cudaStream_t stream,
-                   const PendingCombine* pending = nullptr) = 0;
-  // R += y, y [T, H].
-  virtual void combine(uint16_t* r, const uint16_t* y, int tokens, cudaStream_t stream) = 0;
-  // combine() deferred: the apply handed back for the next mix, or run
-  // here with nothing pending.
-  virtual PendingCombine defer_combine(uint16_t* r, const uint16_t* y, int tokens,
-                                       cudaStream_t stream) = 0;
-  // Applies a pending combine as its own launch (a reader of R that is not a mix).
-  static void apply_pending(uint16_t* r, const PendingCombine& p, int tokens, int hidden,
-                            cudaStream_t stream);
-};
-
-class QwenGrSite : public QwenResidualSite {
- public:
-  using QwenResidualSite::PendingCombine;
-  QwenGrSite(const QwenGrResident& w, const QwenGemmWorkspace& gemm, int hc, int hidden,
-             int lowrank, int max_tokens, float eps);
-  ~QwenGrSite();
-  QwenGrSite(const QwenGrSite&) = delete;
-  QwenGrSite& operator=(const QwenGrSite&) = delete;
-  void rebind(const QwenGrResident& w) { w_ = w; }
   // x[T, H] from R[T, hc*H]; Rn stays in this object for combine().
   // `pending`: the previous site's combine applied first — inside the norm
   // launch on the batched decode rows, as its own launch otherwise.
   void mix(uint16_t* r, uint16_t* x, int tokens, cudaStream_t stream,
-           const PendingCombine* pending = nullptr) override;
+           const PendingCombine* pending = nullptr);
   // R += s(Rn) (x) y, y [T, H]; requires the site's inject weights.
-  void combine(uint16_t* r, const uint16_t* y, int tokens, cudaStream_t stream) override;
+  void combine(uint16_t* r, const uint16_t* y, int tokens, cudaStream_t stream);
   // combine() deferred: when this site's gates were computed by its mix
   // (the fused inject path) the apply is handed back for the next mix;
   // otherwise the combine runs here and nothing is pending.
-  PendingCombine defer_combine(uint16_t* r, const uint16_t* y, int tokens, cudaStream_t stream) override;
+  PendingCombine defer_combine(uint16_t* r, const uint16_t* y, int tokens, cudaStream_t stream);
+  // Applies a pending combine as its own launch (a reader of R that is not a mix).
+  static void apply_pending(uint16_t* r, const PendingCombine& p, int tokens, int hidden, cudaStream_t stream);
   const uint16_t* rn() const { return rn_; }
   // The bytes the constructor allocates for a shape (the memory plan).
   static size_t scratch_bytes(int hc, int hidden, int lowrank, int max_tokens);
@@ -156,68 +153,31 @@ class QwenGrSite : public QwenResidualSite {
   bool mix_fused_ = true;       // act_up with the mix in its epilogue (DGPP_QWEN_GR_MIX_FUSED=off: two launches)
 };
 
-// The plain-residual site (the dense 27B): x = qwen_rmsnorm(R) with the
-// layer's [hidden] weight, R += y as the reference's bf16 add (fp32 interior,
-// one rounding — glm_residual_add_bf16). No deferral: the add is a launch of
-// its own, nothing to fuse into the next norm (the reference materializes R
-// in bf16 between the two). No scratch.
-class QwenPlainSite : public QwenResidualSite {
- public:
-  QwenPlainSite(int hidden, float eps) : hidden_(hidden), eps_(eps) {}
-  void rebind(const uint16_t* w) { w_ = w; }
-  void mix(uint16_t* r, uint16_t* x, int tokens, cudaStream_t stream,
-           const PendingCombine* pending = nullptr) override;
-  void combine(uint16_t* r, const uint16_t* y, int tokens, cudaStream_t stream) override;
-  PendingCombine defer_combine(uint16_t* r, const uint16_t* y, int tokens,
-                               cudaStream_t stream) override;
-
- private:
-  const uint16_t* w_ = nullptr;
-  int hidden_;
-  float eps_;
-};
-
-// ---- Dense SwiGLU MLP (the 27B's plain form) -----------------------------------------
-class QwenDenseMlp {
- public:
-  QwenDenseMlp(const QwenMlpResident& w, const QwenGemmWorkspace& gemm, int hidden,
-               int64_t local_inter, int max_tokens);
-  ~QwenDenseMlp();
-  QwenDenseMlp(const QwenDenseMlp&) = delete;
-  QwenDenseMlp& operator=(const QwenDenseMlp&) = delete;
-  void rebind(const QwenMlpResident& w) { w_ = w; }
-  // out[T, H] = down(swiglu(gate(x), up(x))), the reference's rounding:
-  // bf16(silu(gate)), bf16(that * up), one rounding on the down product.
-  void enqueue(const uint16_t* x, int tokens, uint16_t* out, cudaStream_t stream);
-  static size_t scratch_bytes(int64_t local_inter, int max_tokens);
-
- private:
-  QwenMlpResident w_;
-  QwenGemmWorkspace g_;
-  int hidden_, max_tokens_;
-  int64_t inter_;
-  uint16_t* scratch_ = nullptr;  // [M, 3*I]: gate, up, act
-};
-
 // ---- Gated DeltaNet -----------------------------------------------------------------
 class QwenGdnLayer {
  public:
   QwenGdnLayer(const QwenGdnResident& w, const QwenGemmWorkspace& gemm, const QwenTextConfig& cfg,
-               int max_tokens);
+               int max_tokens, bool swish_gate = false);
   ~QwenGdnLayer();
   QwenGdnLayer(const QwenGdnLayer&) = delete;
   QwenGdnLayer& operator=(const QwenGdnLayer&) = delete;
   void rebind(const QwenGdnResident& w);
+  // The model's per-tensor FP8 projection view for this bind (qwen35 only).
+  void set_pt_attn(const QwenPtAttnView& v) { pt_ = v; }
   // out[T, H] = GDN(x[T, H]); recurrent_state fp32 [lv, V, K] and
   // conv_state bf16 [C, conv_width - 1] updated in place. Speculative rows
   // (the engine's verify) hand post-row snapshots of both states through
   // the KDA sinks (rec_snap.states / conv_snap.states, row strides in
-  // elements): row r's state lands in snapshot row r.
+  // elements): row r's state lands in snapshot row r. resume marks a
+  // prefill continuation chunk (pos0 > 0): its projections take the
+  // per-tensor path at any row count — a short tail chunk otherwise pays
+  // ~1000 decode-row kernel launches for a handful of rows.
   // `replay`: the recurrent state's checkpoint-and-replay form
   // (kernels/kda.hpp KdaReplay) in place of rec_snap.
   void enqueue(const uint16_t* x, float* recurrent_state, uint16_t* conv_state, uint16_t* out,
                int tokens, cudaStream_t stream, const KdaStateSnapshots& rec_snap = {},
-               const KdaConvSnapshots& conv_snap = {}, const KdaReplay& replay = {});
+               const KdaConvSnapshots& conv_snap = {}, const KdaReplay& replay = {},
+               bool resume = false);
   // The request-indexed row form (the fixed decode batch): rec_states /
   // conv_states are slot 0's states, request strides in elements; the
   // row map selects each span's slot, padding rows (pos < 0) write zero
@@ -239,12 +199,13 @@ class QwenGdnLayer {
                               int max_tokens);
 
  private:
-  void in_projections(const uint16_t* x, int tokens, cudaStream_t stream);
+  void in_projections(const uint16_t* x, int tokens, cudaStream_t stream, bool resume);
+  QwenPtAttnView pt_;  // disabled unless the model binds per-tensor weights
   QwenGdnResident w_;
   QwenGemmWorkspace g_;
   int hidden_, lk_, lv_, k_dim_, v_dim_, conv_width_, max_tokens_;
   float eps_, scale_;
-  bool gate_swish_ = false;  // output_gate_type "swish": silu instead of sigmoid
+  bool swish_gate_ = false;  // Qwen3.5 output gate (swish); false = sigmoid
   int64_t conv_channels_ = 0;
   uint16_t* qkv_ = nullptr;     // [M, C]
   uint16_t* qkvc_ = nullptr;    // [M, C] post-conv
@@ -324,7 +285,6 @@ class QwenQsaLayer {
   int max_tokens_;
   int64_t max_pools_;
   float eps_, scale_;
-  bool has_idx_ = true;  // false: the dense form (select-all attention, no indexer)
   // The YaRN attention factor the cos/sin are built with (1.0f off the
   // knob): vLLM bakes mscale into its cos/sin cache, its softmax scale
   // staying head_dim^-0.5 (nvidia/qsa.py: self.scaling).
@@ -346,6 +306,66 @@ class QwenQsaLayer {
   float* c_out_ = nullptr;         // [M, lh * D]
   uint16_t* o_ = nullptr;          // [M, lh * D]
   int n_split_ = 1;
+};
+
+// ---- Qwen3.5 full attention ---------------------------------------------------------
+// Plain GQA over the paged K/V cache: no indexer, no scoring/selection, no
+// ring. One cache view per layer (k/v planes only); rows reuse QwenQsaRows
+// (prefill pos0 needs no kpool multiple — no ring contract — but chunking
+// keeps it aligned anyway; decode needs req_ids/pos only, no spans).
+struct QwenFullAttnCache {
+  uint16_t* k_cache = nullptr;      // bf16 [slots, lkv * D]
+  uint16_t* v_cache = nullptr;      // bf16 [slots, lkv * D]
+  const int32_t* block_tables = nullptr;  // int32 [max_requests, blocks_per_request]
+  int block_tokens = 0;
+  int blocks_per_request = 0;
+  int max_requests = 0;
+  int64_t slots() const { return static_cast<int64_t>(block_tokens) * blocks_per_request; }
+};
+
+class QwenFullAttnLayer {
+ public:
+  QwenFullAttnLayer(const QwenFullAttnResident& w, const QwenGemmWorkspace& gemm,
+                    const QwenTextConfig& cfg, int max_tokens);
+  ~QwenFullAttnLayer();
+  QwenFullAttnLayer(const QwenFullAttnLayer&) = delete;
+  QwenFullAttnLayer& operator=(const QwenFullAttnLayer&) = delete;
+  void rebind(const QwenFullAttnResident& w);
+  // The model's per-tensor FP8 projection view for this bind (qwen35 only).
+  void set_pt_attn(const QwenPtAttnView& v) { pt_ = v; }
+
+  // out[T, H] = FullAttn(x[T, H]): projections, norm + RoPE, the K/V
+  // appends, dense causal attention (the tile form over a prefill chunk's
+  // rows of one request; the split row form over decode rows), the gated
+  // output projection.
+  void enqueue(const uint16_t* x, int tokens, const QwenQsaRows& rows, QwenFullAttnCache& cache,
+               uint16_t* out, cudaStream_t stream);
+
+  static size_t scratch_bytes(const QwenTextConfig& cfg, int local_heads, int local_kv_heads,
+                              int max_tokens);
+  int local_heads() const { return lh_; }
+  int local_kv_heads() const { return lkv_; }
+
+ private:
+  QwenPtAttnView pt_;  // disabled unless the model binds per-tensor weights
+  QwenFullAttnResident w_;
+  QwenGemmWorkspace g_;
+  int hidden_, lh_, lkv_, dim_, rotary_;
+  int max_tokens_;
+  float eps_, scale_;
+  float mscale_ = 1.0f;
+  float* d_inv_freq_ = nullptr;  // [rotary/2]
+  uint16_t* q_ = nullptr;        // [M, lh * 2D]
+  uint16_t* k_ = nullptr;        // [M, lkv * D]
+  uint16_t* v_ = nullptr;        // [M, lkv * D]
+  uint16_t* qn_ = nullptr;       // [M, lh * D]
+  uint16_t* kn_ = nullptr;       // [M, lkv * D]
+  float* c_out_ = nullptr;       // [M, lh * D]
+  uint16_t* o_ = nullptr;        // [M, lh * D]
+  // The decode form's split-walk partials (kernels/full_attn.hpp), sized
+  // for kPartRows rows; wider decode batches walk unsplit.
+  static constexpr int kPartRows = 64;
+  float* part_ = nullptr;
 };
 
 // ---- the n-gram embedding layer -----------------------------------------------------

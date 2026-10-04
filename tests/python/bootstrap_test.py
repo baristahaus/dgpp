@@ -66,12 +66,21 @@ class BootstrapTest(unittest.TestCase):
         self.assertNotIn("secret-do-not-print", self.output.getvalue())
 
     def test_invalid_nodes_or_override_does_not_write_configuration(self):
-        for nodes in ("head head", "$(touch marker)", "head"):
+        # "head head" is no longer invalid — a host listed twice stacks two
+        # ranks on one machine (test below); only shell syntax and a node
+        # count short of world_size are refused.
+        for nodes in ("$(touch marker)", "head"):
             self.template.write_text(json.dumps({"model": "org/model", "world_size": 2}))
             with self.assertRaises(ValueError):
                 setup.main([*self.args, "--configure-only", "--nodes", nodes])
             self.assertFalse(self.site.exists())
             self.assertFalse(self.config.exists())
+
+    def test_repeated_host_stacks_ranks_and_configures(self):
+        self.template.write_text(json.dumps({"model": "org/model", "world_size": 2}))
+        self.assertEqual(setup.main([*self.args, "--configure-only", "--nodes", "head head"]), 0)
+        values = site_env.settings({"DGPP_ENV_FILE": str(self.site)})
+        self.assertEqual(site_env.site_nodes(values), ["head", "head"])
 
     def test_exported_conflict_is_reported_before_writes(self):
         with patch.dict(os.environ, {"DGPP_NODES": "head"}):

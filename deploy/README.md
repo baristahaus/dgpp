@@ -11,7 +11,7 @@ without `.example` and stay Git-ignored; the launcher fills the nodes, the SSH
 user and the ports from the site's `.env` (`scripts/site_env.py`).
 
 - Model names are `glm-5.3-flash`, `glm-5.3` (the full model), `glm-4.7`,
-  `qwen-3.8-flash-next`, `deepseek-v4.1-flash` and `mimo-v2.6-flash`.
+  `qwen-3.8-flash-next`, `qwen3.8-27b`, `deepseek-v4.1-flash` and `mimo-v2.6-flash`.
 - The quant names the checkpoint representation: `fp8`, `nvfp4`,
   `nvfp4-fp8` for the custom GLM-5.3-Flash hybrid, `int4-int8` for the full
   GLM-5.3's pack-quantized release (int4 group-64 routed experts, int8
@@ -26,7 +26,10 @@ user and the ports from the site's `.env` (`scripts/site_env.py`).
 
 Every template enables MTP (the block draft on DeepSeek) at the depth the
 family measured best, with the decode graph, at the request-slot count and
-cache budget that measured at or above every other shape tried. The shapes
+cache budget that measured at or above every other shape tried — except a
+`_dflash2` variant, which names `engine.dflash_model` instead of MTP and
+runs the eager world-1 path (no graph), the external block drafter
+replacing the MTP draft. The shapes
 a template does not name are knobs appended at boot:
 `scripts/dgpp-cluster up --config FILE --knobs "FLAGS"`.
 
@@ -49,6 +52,9 @@ a template does not name are knobs appended at boot:
 | [cluster_deepseek-v4.1-flash_mxfp4-fp8_w4.example.json](cluster_deepseek-v4.1-flash_mxfp4-fp8_w4.example.json) | DeepSeek-V4.1-Flash as shipped on four nodes: six request slots at DSpark depth 4 (30 decode rows in one batched replay, the family's 32-row cap) with the confidence-scheduled verify depth (λ 0.045), the bounded prefill, 128K context — the six-stream shape the vLLM recipe reports its aggregate at; single and dual streams measure the same as the two-slot shapes did | the two-slot depth-5 shape: `--max-concurrency 2 --mtp-depth 5`; the two-slot depth-4 shape: `--max-concurrency 2`; T=1 at four slots: `--no-mtp --max-concurrency 4` |
 | [cluster_deepseek-v4-flash_mxfp4-fp8_w4.example.json](cluster_deepseek-v4-flash_mxfp4-fp8_w4.example.json) | DeepSeek-V4-Flash (the 0731 release) as shipped on four nodes: MXFP4 routed experts and FP8 dense projections consumed as they are, the DSpark block draft (five drafts) under the confidence-scheduled verify depth (`"mtp_schedule": true` with this world's measured row and base costs: a pass verifies as many drafts as their survival pays for, any depth from one to five — mostly two or three on prose, the whole block on code and JSON), sampled requests scheduled too with the draft's most likely tokens (`engine.mtp_draft` greedy for this family, `engine.mtp_schedule_sampled_scale` 0.93), six request slots, the model's full 1M-token context (63.2 GiB per rank with the 14 GiB prefix cache; the compressed caches take 6.2 GiB per rank at 1M) | T=1: `--no-mtp`; a fixed depth instead of the schedule: set `"mtp_schedule": false` and `"mtp_depth"` (3 measured best fixed on prose, 5 on code and JSON); sampled requests drafting by draw: `--mtp-draft sampled` |
 | [cluster_deepseek-v4-flash_mxfp4-fp8_w2.example.json](cluster_deepseek-v4-flash_mxfp4-fp8_w2.example.json) | the same on two nodes: the scheduled DSpark depth with the two-node costs, four request slots, the full 1M-token context (95.8 GiB of the 121.6 GiB per rank with an 8 GiB prefix cache) | T=1: `--no-mtp` |
+| [cluster_qwen3.8-27b_fp8_w1.example.json](cluster_qwen3.8-27b_fp8_w1.example.json) | Qwen3.8-27B-FP8 on one Spark: the dense 27B (48 Gated-DeltaNet + 16 full-attention layers) from its native block-FP8 checkpoint, MTP depth 2 with the decode graph, 256K context, eight request slots; the lm head requantized to block FP8 (`dense_weights: "fp8"`: half its bytes per decode row, MTP depth-2 C1 151 → 132 ms/step at the same acceptance, HumanEval/GSM8K 39/40 each), the rest exact | T=1: `--no-mtp`; the checkpoint's BF16 head: `--dense-weights checkpoint`; the opt-in prefill recipe `--prefill-fp8-per-tensor` (cuBLASLt's per-tensor e4m3 kernels, ~2x the prefill rate; changes long-context transcripts) |
+| [cluster_qwen3.8-27b_fp8_w1_dflash2.example.json](cluster_qwen3.8-27b_fp8_w1_dflash2.example.json) | Qwen3.8-27B-FP8 on one Spark with the DFlash2 block drafter (`engine.dflash_model: z-lab/Qwen3.8-27B-DFlash2`, the MTP draft off, the eager world-1 engine): seven drafts per step through the shared head and the rank-256 selector walk, the multi-slot verify replayed as a captured graph (`engine.dflash_verify_graph`), the redrafts stacked across slots (`engine.dflash_draft_batch`); the FP8 lm head like the base template (C1 180 → 164 ms/step, C4 246–262 → 217–231) | plain from this template: `--no-dflash`; the eager verify batch: `--no-dflash-verify-graph`; a verify-depth cap: `--dflash-depth N` |
+| [cluster_qwen3.8-27b_fp8_w2.example.json](cluster_qwen3.8-27b_fp8_w2.example.json) | Qwen3.8-27B-FP8 on two Sparks (tensor parallel: the GDN and attention heads, the MLP and the lm head split across the ranks, two boundary folds a layer), MTP depth 2 with the decode graph, 256K context, eight request slots, the FP8 lm head | T=1: `--no-mtp`; the checkpoint's BF16 head: `--dense-weights checkpoint`; the DFlash2 drafter is the world-1 recipe's |
 
 The Qwen NVFP4 templates use `engine.fp8_head: "mma"` after matched
 [real-checkpoint numerical checks](../benchmarks/results/2026-09-21-qwen-fp8-head-numerics.md)

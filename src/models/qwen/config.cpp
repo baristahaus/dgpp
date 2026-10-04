@@ -114,15 +114,8 @@ QwenTextConfig QwenTextConfig::parse(const minijson::Value& tc,
   if (!tc.is_object()) reject("text_config", "not an object");
   QwenTextConfig c;
   const std::string model_type = optional_string(tc, "model_type", "qwen4_exp_text");
-  if (model_type != "qwen4_exp_text" && model_type != "qwen3_5_text")
-    reject("model_type", "expected qwen4_exp_text or qwen3_5_text, got " + model_type);
-  // The dense Qwen3.8-27B (docs/qwen38_27b_dense_plan.md §1): the same GDN
-  // + full-attention hybrid and MTP draft as the Flash-Next family, with a
-  // plain residual (no hc_* keys), no indexer, a dense SwiGLU MLP and no
-  // quantization_config (the BF16 release; engine.dense_weights selects the
-  // at-load FP8 encode).
-  const bool dense27 = model_type == "qwen3_5_text";
-  c.model_type = model_type;
+  if (model_type != "qwen4_exp_text")
+    reject("model_type", "expected qwen4_exp_text, got " + model_type);
 
   c.hidden_size = require_int(tc, "hidden_size");
   c.vocab_size = require_int(tc, "vocab_size");
@@ -182,19 +175,13 @@ QwenTextConfig QwenTextConfig::parse(const minijson::Value& tc,
   c.bos_token_id = optional_int64(tc, "bos_token_id", -1);
 
   // --- gated residual ---------------------------------------------------------
-  // Absent on the dense 27B (a plain residual); required on the Flash-Next
-  // family, whose kernels are 4-branch.
-  c.hc_count = optional_int(tc, "hc_count", 0);
-  c.hc_lowrank = optional_int(tc, "hc_lowrank", 0);
-  if (c.hc_count == 0) {
-    if (!dense27) reject("hc_count", "missing (the qwen4_exp layers are hyper-connected)");
-  } else {
-    if (c.hc_count != 4)
-      reject("hc_count", "the gated-residual kernels are 4-branch (got " +
-                             std::to_string(c.hc_count) + ")");
-    if (c.hc_lowrank <= 0 || c.hc_lowrank % 8 != 0)
-      reject("hc_lowrank", "must be a positive multiple of 8");
-  }
+  c.hc_count = require_int(tc, "hc_count");
+  c.hc_lowrank = require_int(tc, "hc_lowrank");
+  if (c.hc_count != 4)
+    reject("hc_count", "the gated-residual kernels are 4-branch (got " +
+                           std::to_string(c.hc_count) + ")");
+  if (c.hc_lowrank <= 0 || c.hc_lowrank % 8 != 0)
+    reject("hc_lowrank", "must be a positive multiple of 8");
 
   // --- Gated DeltaNet ---------------------------------------------------------
   c.gdn_key_heads = require_int(tc, "linear_num_key_heads");
@@ -210,10 +197,8 @@ QwenTextConfig QwenTextConfig::parse(const minijson::Value& tc,
     reject("linear_key_head_dim", "the GDN kernels implement 128-wide heads");
   if (c.gdn_conv_width < 2 || c.gdn_conv_width > 8)
     reject("linear_conv_kernel_dim", "must be in [2, 8]");
-  // The dense 27B gates with swish (silu); the Flash-Next family with the
-  // logistic sigmoid. The kind rides the layer plan into the GDN kernels.
-  if (c.output_gate_type != "sigmoid" && c.output_gate_type != "swish")
-    reject("output_gate_type", "only the sigmoid and swish output gates are implemented, got " +
+  if (c.output_gate_type != "sigmoid")
+    reject("output_gate_type", "only the sigmoid output gate is implemented, got " +
                                    c.output_gate_type);
   if (const std::string dt = optional_string(tc, "mamba_ssm_dtype", "float32");
       dt != "float32")
@@ -265,52 +250,33 @@ QwenTextConfig QwenTextConfig::parse(const minijson::Value& tc,
         reject("rope_parameters.mrope_section", "must be three sections summing to rotary_dim / 2");
     }
   }
-  // Absent on the dense 27B: the full-attention layers then select all
-  // pools (full history) — no scoring pass, no compressed-key maintenance.
-  if (tc.find("indexer_n_heads") == nullptr || tc.find("indexer_n_heads")->is_null()) {
-    if (!dense27) reject("indexer_n_heads", "missing (the qwen4_exp QSA layers are indexed)");
-    c.indexer_n_heads = 0;  // has_indexer() == false: select-all attention
-  } else {
-    c.indexer_n_heads = require_int(tc, "indexer_n_heads");
-    c.indexer_kv_heads = require_int(tc, "indexer_kv_heads");
-    c.indexer_head_dim = require_int(tc, "indexer_head_dim");
-    c.indexer_budget = require_int(tc, "indexer_budget");
-    c.indexer_compress_ratio = require_int(tc, "indexer_compress_ratio");
-    if (c.indexer_kv_heads != 1) reject("indexer_kv_heads", "QSA requires one indexer key head");
-    if (c.indexer_n_heads <= 0) reject("indexer_n_heads", "must be positive");
-    if (c.indexer_head_dim != 128) reject("indexer_head_dim", "the indexer kernels implement 128");
-    if (c.indexer_compress_ratio < 2) reject("indexer_compress_ratio", "must be at least 2");
-    if (c.indexer_budget <= 0 || c.indexer_budget % c.indexer_compress_ratio != 0)
-      reject("indexer_budget", "must be a positive multiple of indexer_compress_ratio");
-    if (c.rotary_dim > c.indexer_head_dim)
-      reject("indexer_head_dim", "the attention's rotary dims must fit the indexer head");
-  }
+  c.indexer_n_heads = require_int(tc, "indexer_n_heads");
+  c.indexer_kv_heads = require_int(tc, "indexer_kv_heads");
+  c.indexer_head_dim = require_int(tc, "indexer_head_dim");
+  c.indexer_budget = require_int(tc, "indexer_budget");
+  c.indexer_compress_ratio = require_int(tc, "indexer_compress_ratio");
+  if (c.indexer_kv_heads != 1) reject("indexer_kv_heads", "QSA requires one indexer key head");
+  if (c.indexer_n_heads <= 0) reject("indexer_n_heads", "must be positive");
+  if (c.indexer_head_dim != 128) reject("indexer_head_dim", "the indexer kernels implement 128");
+  if (c.indexer_compress_ratio < 2) reject("indexer_compress_ratio", "must be at least 2");
+  if (c.indexer_budget <= 0 || c.indexer_budget % c.indexer_compress_ratio != 0)
+    reject("indexer_budget", "must be a positive multiple of indexer_compress_ratio");
+  if (c.rotary_dim > c.indexer_head_dim)
+    reject("indexer_head_dim", "the attention's rotary dims must fit the indexer head");
 
-  // --- MoE / dense MLP -------------------------------------------------------
-  if (dense27 && tc.find("num_experts") != nullptr)
-    reject("num_experts",
-           "the qwen3_5 port serves the dense release (a routed MoE under this "
-           "model_type is not implemented)");
-  c.num_experts = optional_int(tc, "num_experts", 0);
-  if (c.has_moe()) {
-    c.num_experts_per_tok = require_int(tc, "num_experts_per_tok");
-    c.moe_intermediate_size = require_int(tc, "moe_intermediate_size");
-    c.shared_expert_intermediate_size = require_int(tc, "shared_expert_intermediate_size");
-    c.norm_topk_prob = optional_bool(tc, "norm_topk_prob", true);
-    if (c.num_experts <= 0 || c.num_experts > 4096) reject("num_experts", "must be in [1, 4096]");
-    if (c.num_experts_per_tok <= 0 || c.num_experts_per_tok > c.num_experts ||
-        c.num_experts_per_tok > 16)
-      reject("num_experts_per_tok", "must be in [1, min(num_experts, 16)]");
-    if (c.moe_intermediate_size <= 0 || c.shared_expert_intermediate_size <= 0)
-      reject("moe_intermediate_size", "must be positive");
-    if (!c.norm_topk_prob) reject("norm_topk_prob", "the router renormalizes the top-k (true)");
-  } else {
-    if (!dense27) reject("num_experts", "missing (the qwen4_exp layers are routed)");
-    // The dense SwiGLU MLP's width (the 27B's 17408).
-    c.intermediate_size = require_int(tc, "intermediate_size");
-    if (c.intermediate_size <= 0 || c.intermediate_size % 8 != 0)
-      reject("intermediate_size", "must be a positive multiple of 8");
-  }
+  // --- MoE --------------------------------------------------------------------
+  c.num_experts = require_int(tc, "num_experts");
+  c.num_experts_per_tok = require_int(tc, "num_experts_per_tok");
+  c.moe_intermediate_size = require_int(tc, "moe_intermediate_size");
+  c.shared_expert_intermediate_size = require_int(tc, "shared_expert_intermediate_size");
+  c.norm_topk_prob = optional_bool(tc, "norm_topk_prob", true);
+  if (c.num_experts <= 0 || c.num_experts > 4096) reject("num_experts", "must be in [1, 4096]");
+  if (c.num_experts_per_tok <= 0 || c.num_experts_per_tok > c.num_experts ||
+      c.num_experts_per_tok > 16)
+    reject("num_experts_per_tok", "must be in [1, min(num_experts, 16)]");
+  if (c.moe_intermediate_size <= 0 || c.shared_expert_intermediate_size <= 0)
+    reject("moe_intermediate_size", "must be positive");
+  if (!c.norm_topk_prob) reject("norm_topk_prob", "the router renormalizes the top-k (true)");
 
   // --- PLE --------------------------------------------------------------------
   if (const minijson::Value* pl = tc.find("ple_layer_ids"); pl && !pl->is_null()) {
@@ -365,25 +331,10 @@ QwenTextConfig QwenTextConfig::parse(const minijson::Value& tc,
     reject("mtp_use_dedicated_embeddings", "the draft shares the embeddings");
 
   // --- quantization -----------------------------------------------------------
-  if (quantization_config == nullptr || quantization_config->is_null()) {
-    if (dense27) {
-      // The BF16 release: every tensor ships BF16 and the resident encode is
-      // the engine's at-load choice (engine.dense_weights; the loader's
-      // deterministic block-128 E4M3 path). The format flags stay false.
-      c.experts_fp8 = false;
-      c.experts_nvfp4 = false;
-      c.experts_gptq_int4 = false;
-      c.ngram_table_fp8 = false;  // no PLE on this release
-      return c;
-    }
+  if (quantization_config == nullptr || quantization_config->is_null())
     throw std::runtime_error(
         "Qwen quantization_config: missing — the engine implements the FP8 "
         "release (routed experts and the n-gram table in e4m3)");
-  }
-  if (dense27)
-    throw std::runtime_error(
-        "Qwen quantization_config: the qwen3_5 port serves the BF16 release "
-        "(engine.dense_weights selects the at-load encode)");
   {
     const minijson::Value& q = *quantization_config;
     const std::string method = optional_string(q, "quant_method", "");
@@ -488,13 +439,9 @@ QwenTextConfig QwenTextConfig::from_json_file(const std::string& path) {
   if (!tc) throw std::runtime_error("config " + path + ": missing text_config object");
   QwenTextConfig c = parse(*tc, parsed.root.find("quantization_config"));
   // A checkpoint that ships a vision tower serves images with it; the root
-  // object holds both the tower's config and the image token ids. The dense
-  // 27B's tower is not served (the port is text-only, §2): its config is
-  // skipped and the unset token triple refuses image content at request
-  // validation — the visual tensors never enter the loader's expected set.
-  if (c.model_type != "qwen3_5_text")
-    if (const auto* vision = parsed.root.find("vision_config"); vision && !vision->is_null())
-      c.vision = QwenVisionConfig::parse(parsed.root, c.hidden_size);
+  // object holds both the tower's config and the image token ids.
+  if (const auto* vision = parsed.root.find("vision_config"); vision && !vision->is_null())
+    c.vision = QwenVisionConfig::parse(parsed.root, c.hidden_size);
   return c;
 }
 

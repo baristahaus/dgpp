@@ -22,12 +22,10 @@ void glm_rmsnorm_bf16(const void* x, const void* weight, void* y, int rows,
 // Initializes the mHC residual streams: streams[t, s, h] = embed[tokens[t],
 // h] for all s < hc_mult (the reference's expand of the embedding). hc_mult
 // is pinned to 4 by the config parser (kernel smem layouts assume it).
-// streams: bf16 [num_tokens, branches, hidden]; embed_table: bf16 [vocab,
-// hidden]. GLM's callers pin branches to 4 (kernel smem layouts assume the
-// four-branch form); the Qwen dense form passes 1.
+// streams: bf16 [num_tokens, 4, hidden]; embed_table: bf16 [vocab, hidden].
 void glm_embed_bcast_streams(const void* embed_table, const int64_t* tokens,
                              void* streams, int num_tokens, int hidden,
-                             int branches, cudaStream_t stream);
+                             cudaStream_t stream);
 
 // ---- MTP draft block (DESIGN §9) -------------------------------------------
 // out[t] = [rmsnorm(embed[tokens[t]]) * enorm | rmsnorm(hidden_cache[pos_t])
