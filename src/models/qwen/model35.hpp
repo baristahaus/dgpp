@@ -371,6 +371,13 @@ class Qwen35Model : public SessionModel<Qwen35Model> {
   uint8_t* head_fp8_ = nullptr;  // [V, H] E4M3
   float* head_scales_ = nullptr;  // [ceil(V/128), H/128] F32 (device)
   bool head_fp8_enabled_ = false;
+  // The NVFP4 mixed release's head: channel fp8 straight from the loader
+  // (globals_.lm_head_fp8 — no BF16 head exists in that checkpoint, so
+  // neither the boot requant nor the BF16 fallback applies).
+  bool mixed_head_ = false;
+  // This rank's MLP slice (the loader geometry's local_inter): the dense
+  // MLP's I for the forms that do not carry it in a resident field.
+  int64_t local_inter_ = 0;
   std::vector<int> pt_gdn_ord_;   // per main-layer index, else -1
   std::vector<int> pt_full_ord_;  // per main-layer index, else -1
   // Activation scratch at max_tokens rows.

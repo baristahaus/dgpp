@@ -29,6 +29,24 @@ void add_fp8(TensorList& out, const std::string& name, int64_t rows, int64_t col
       QwenTensorRole::Fp8Scale);
 }
 
+// The NVFP4 mixed release's channel form: e4m3 [N, K] + BF16 [N, 1]
+// weight_scale — one scale per weight row, MULTIPLY on dequant.
+void add_channel_fp8(TensorList& out, const std::string& name, int64_t rows, int64_t cols,
+                     QwenWeightClass cls, int layer) {
+  add(out, name, DType::F8_E4M3, {rows, cols}, cls, layer, -1,
+      QwenTensorRole::ChannelFp8Payload);
+  add(out, name + "_scale", DType::BF16, {rows, 1}, cls, layer, -1,
+      QwenTensorRole::ChannelFp8Scale);
+}
+
+// The mixed release's weight form picker for a projection at `layer`:
+// the float-quantized group covers every attention projection (channel
+// fp8) under Nvfp4Mixed; the MTP draft stays BF16 (its file carries no
+// quantized tensors).
+bool attn_is_channel(const Qwen35TextConfig& cfg, int layer) {
+  return cfg.quant_kind == Qwen35QuantKind::Nvfp4Mixed && layer < cfg.num_hidden_layers;
+}
+
 void expect_gdn35(TensorList& out, const std::string& p, const Qwen35TextConfig& cfg, int layer) {
   const int64_t H = cfg.hidden_size;
   const int64_t kdim = static_cast<int64_t>(cfg.gdn_key_heads) * cfg.gdn_key_head_dim;
@@ -40,10 +58,20 @@ void expect_gdn35(TensorList& out, const std::string& p, const Qwen35TextConfig&
   add_bf16(out, p + "conv1d.weight", {2 * kdim + vdim, 1, cfg.gdn_conv_width}, c, layer);
   add_bf16(out, p + "in_proj_a.weight", {vh, H}, c, layer);
   add_bf16(out, p + "in_proj_b.weight", {vh, H}, c, layer);
-  add_fp8(out, p + "in_proj_qkv.weight", 2 * kdim + vdim, H, c, layer);
-  add_fp8(out, p + "in_proj_z.weight", vdim, H, c, layer);
+  const bool ch = attn_is_channel(cfg, layer);
+  if (ch)
+    add_channel_fp8(out, p + "in_proj_qkv.weight", 2 * kdim + vdim, H, c, layer);
+  else
+    add_fp8(out, p + "in_proj_qkv.weight", 2 * kdim + vdim, H, c, layer);
+  if (ch)
+    add_channel_fp8(out, p + "in_proj_z.weight", vdim, H, c, layer);
+  else
+    add_fp8(out, p + "in_proj_z.weight", vdim, H, c, layer);
   add_bf16(out, p + "norm.weight", {cfg.gdn_value_head_dim}, c, layer);
-  add_fp8(out, p + "out_proj.weight", H, vdim, c, layer);
+  if (ch)
+    add_channel_fp8(out, p + "out_proj.weight", H, vdim, c, layer);
+  else
+    add_fp8(out, p + "out_proj.weight", H, vdim, c, layer);
 }
 
 void expect_full35(TensorList& out, const std::string& p, const Qwen35TextConfig& cfg, int layer) {
@@ -51,13 +79,54 @@ void expect_full35(TensorList& out, const std::string& p, const Qwen35TextConfig
   const int64_t qh = cfg.num_attention_heads, kvh = cfg.num_key_value_heads;
   const int64_t d = cfg.head_dim;
   const QwenWeightClass c = QwenWeightClass::FullAttn;
+  if (!attn_is_channel(cfg, layer)) {
+    // The FP8 block release's form, and the mixed release's MTP draft
+    // under it: BF16 on the draft.
+    if (cfg.quant_kind == Qwen35QuantKind::Nvfp4Mixed) {
+      add_bf16(out, p + "q_proj.weight", {2 * qh * d, H}, c, layer);
+      add_bf16(out, p + "k_proj.weight", {kvh * d, H}, c, layer);
+      add_bf16(out, p + "v_proj.weight", {kvh * d, H}, c, layer);
+      add_bf16(out, p + "o_proj.weight", {H, qh * d}, c, layer);
+    } else {
+      add_fp8(out, p + "q_proj.weight", 2 * qh * d, H, c, layer);
+      add_fp8(out, p + "k_proj.weight", kvh * d, H, c, layer);
+      add_fp8(out, p + "v_proj.weight", kvh * d, H, c, layer);
+      add_fp8(out, p + "o_proj.weight", H, qh * d, c, layer);
+    }
+    add_bf16(out, p + "q_norm.weight", {d}, c, layer);
+    add_bf16(out, p + "k_norm.weight", {d}, c, layer);
+    return;
+  }
   // The q projection stacks [q | gate] per head (attn_output_gate).
-  add_fp8(out, p + "q_proj.weight", 2 * qh * d, H, c, layer);
-  add_fp8(out, p + "k_proj.weight", kvh * d, H, c, layer);
-  add_fp8(out, p + "v_proj.weight", kvh * d, H, c, layer);
-  add_fp8(out, p + "o_proj.weight", H, qh * d, c, layer);
+  add_channel_fp8(out, p + "q_proj.weight", 2 * qh * d, H, c, layer);
+  add_channel_fp8(out, p + "k_proj.weight", kvh * d, H, c, layer);
+  add_channel_fp8(out, p + "v_proj.weight", kvh * d, H, c, layer);
+  add_channel_fp8(out, p + "o_proj.weight", H, qh * d, c, layer);
   add_bf16(out, p + "q_norm.weight", {d}, c, layer);
   add_bf16(out, p + "k_norm.weight", {d}, c, layer);
+  // The 8-bit-KV hint scales (one scalar per layer): registered so the
+  // binding accounts for them; the loader note-reads and discards — this
+  // release runs BF16 KV.
+  add_bf16(out, p + "k_scale", {1}, c, layer);
+  add_bf16(out, p + "v_scale", {1}, c, layer);
+}
+
+// The mixed release's NVFP4 MLP quadruple (compressed-tensors
+// `nvfp4-pack-quantized`, group 16): base.weight_packed U8 [rows, cols/2],
+// base.weight_scale e4m3 [rows, cols/16], base.weight_global_scale F32 [1]
+// (the loader stores its reciprocal — the kernels' divide-once form), and
+// base.input_global_scale F32 [1] (the W4A4 recipe's activation scale —
+// note-read and discarded, W4A16 here).
+void add_fp4_mlp(TensorList& out, const std::string& base, int64_t rows, int64_t cols, int layer) {
+  const QwenWeightClass c = QwenWeightClass::DenseMlp;
+  add(out, base + ".weight_packed", DType::U8, {rows, cols / 2}, c, layer, -1,
+      QwenTensorRole::Fp4Payload);
+  add(out, base + ".weight_scale", DType::F8_E4M3, {rows, cols / 16}, c, layer, -1,
+      QwenTensorRole::Fp4Scale);
+  add(out, base + ".weight_global_scale", DType::F32, {1}, c, layer, -1,
+      QwenTensorRole::Fp4Global);
+  add(out, base + ".input_global_scale", DType::F32, {1}, c, layer, -1,
+      QwenTensorRole::InputScale);
 }
 
 void expect_dense_mlp35(TensorList& out, const std::string& p, const Qwen35TextConfig& cfg,
@@ -65,6 +134,25 @@ void expect_dense_mlp35(TensorList& out, const std::string& p, const Qwen35TextC
   const int64_t H = cfg.hidden_size;
   const int64_t I = cfg.intermediate_size;
   const QwenWeightClass c = QwenWeightClass::DenseMlp;
+  if (cfg.quant_kind == Qwen35QuantKind::Nvfp4Mixed) {
+    if (layer >= cfg.num_hidden_layers) {
+      // The MTP draft under the mixed release: BF16.
+      add_bf16(out, p + "gate_proj.weight", {I, H}, c, layer);
+      add_bf16(out, p + "up_proj.weight", {I, H}, c, layer);
+      add_bf16(out, p + "down_proj.weight", {H, I}, c, layer);
+      return;
+    }
+    if (cfg.mlp_is_channel(layer)) {
+      add_channel_fp8(out, p + "gate_proj.weight", I, H, c, layer);
+      add_channel_fp8(out, p + "up_proj.weight", I, H, c, layer);
+      add_channel_fp8(out, p + "down_proj.weight", H, I, c, layer);
+      return;
+    }
+    add_fp4_mlp(out, p + "gate_proj", I, H, layer);
+    add_fp4_mlp(out, p + "up_proj", I, H, layer);
+    add_fp4_mlp(out, p + "down_proj", H, I, layer);
+    return;
+  }
   add_fp8(out, p + "gate_proj.weight", I, H, c, layer);
   add_fp8(out, p + "up_proj.weight", I, H, c, layer);
   add_fp8(out, p + "down_proj.weight", H, I, c, layer);
@@ -111,7 +199,14 @@ std::vector<QwenExpectedTensor> qwen35_expected_global_tensors(const Qwen35TextC
   const int64_t H = cfg.hidden_size;
   add_bf16(out, "model.language_model.embed_tokens.weight", {cfg.vocab_size, H},
            QwenWeightClass::Embed, -1);
-  add_bf16(out, "lm_head.weight", {cfg.vocab_size, H}, QwenWeightClass::LmHead, -1);
+  // The FP8 block release carries a BF16 head; the mixed release quantizes
+  // it channel-wise (e4m3 + BF16 [V, 1] weight_scale) — there is no BF16
+  // head in that checkpoint at all.
+  if (cfg.quant_kind == Qwen35QuantKind::Nvfp4Mixed) {
+    add_channel_fp8(out, "lm_head.weight", cfg.vocab_size, H, QwenWeightClass::LmHead, -1);
+  } else {
+    add_bf16(out, "lm_head.weight", {cfg.vocab_size, H}, QwenWeightClass::LmHead, -1);
+  }
   add_bf16(out, "model.language_model.norm.weight", {H}, QwenWeightClass::Norm, -1);
   if (cfg.mtp_layer() >= 0) {
     // The fused head projection (embedding + hidden pre-projection).

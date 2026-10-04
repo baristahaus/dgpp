@@ -12,12 +12,14 @@
 
 namespace dgpp {
 
-// Enqueues the dequant for a [rows, cols] E4M3 payload with an F32
-// [ceil(rows/128), ceil(cols/128)] row-major scale grid. Ragged tail blocks
-// (rows or cols not a multiple of 128) are handled; out-of-block elements
-// never read their scale. Async on `stream`.
+// Enqueues the dequant for a [rows, cols] E4M3 payload with an F32 scale
+// grid in the grid launchers' log2 form: [ceil(rows / 2^rs),
+// ceil(cols / 2^cs)] row-major (defaults 7/7: the checkpoint's 128 x 128
+// blocks). Ragged tail blocks (rows or cols not a multiple of the block)
+// are handled; out-of-block elements never read their scale. Async on
+// `stream`.
 void launch_fp8_dequant_blocks(const uint8_t* payload, const float* scales,
                                uint16_t* out_bf16, int64_t rows, int64_t cols,
-                               cudaStream_t stream);
+                               cudaStream_t stream, int rs = 7, int cs = 7);
 
 }  // namespace dgpp

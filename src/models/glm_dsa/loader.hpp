@@ -147,7 +147,7 @@ struct GlmDsaLoaderFamily {
   using PresentMap = std::unordered_map<std::string, GlmDsaTensorDesc>;
   struct Builder;  // models/glm_dsa/loader.cpp
   static const char* who() { return "glm_dsa loader"; }
-  static uint64_t loader_format() { return 1; }
+  static uint64_t loader_format(const Config&) { return 1; }
   static int max_layer(const Config& c) { return c.num_hidden_layers + (c.mtp_layer() >= 0 ? 1 : 0); }
   static int main_layers(const Config& c) { return c.num_hidden_layers; }
   static std::vector<Expected> layer_table(const Config& c, int layer) {

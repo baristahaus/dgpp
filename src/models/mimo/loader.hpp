@@ -137,7 +137,7 @@ struct MimoLoaderFamily {
   using PresentMap = std::unordered_map<std::string, MimoTensorDesc>;
   struct Builder;  // models/mimo/loader.cpp
   static const char* who() { return "mimo loader"; }
-  static uint64_t loader_format() { return 1; }
+  static uint64_t loader_format(const Config&) { return 1; }
   static int max_layer(const Config& c) { return c.num_hidden_layers + c.mtp_layers_loaded; }
   static int main_layers(const Config& c) { return c.num_hidden_layers; }
   static std::vector<Expected> layer_table(const Config& c, int layer) {

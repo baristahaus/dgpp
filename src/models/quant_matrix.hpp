@@ -30,6 +30,28 @@ struct GlmQuantMatrix {
   }
 };
 
+// The grid consumers' log2 form (kernels/scale_gemm.hpp): rs is the exact
+// log2 of the row block — a power of two, 1 (the NVFP4 release's channel
+// form, one scale per weight row) through 128 — and cs the exact log2 of
+// the column block, which must be >= 16 so the fp8 GEMV's 16-byte chunk
+// never straddles two scale columns. Channel form: rs = 0, cs =
+// ceil_log2(cols). The consumers index scales[(n >> rs) * scale_cols +
+// (k >> cs)] with scale_cols = ceil(cols / 2^cs), which is the matrix's
+// own scale_cols() under these constraints — one grid, no re-blocking.
+inline void quant_scale_log2(const GlmQuantMatrix& m, int& rs, int& cs) {
+  int r = 0;
+  while ((1 << r) < m.scale_block_rows) ++r;
+  if ((1 << r) != m.scale_block_rows)
+    throw std::invalid_argument("quant_scale_log2: scale_block_rows must be a power of two");
+  int c = 0;
+  while ((1 << c) < m.scale_block_cols) ++c;
+  if (m.scale_block_cols < 16)
+    throw std::invalid_argument(
+        "quant_scale_log2: scale_block_cols must be >= 16 (the 16-byte chunk rule)");
+  rs = r;
+  cs = c;
+}
+
 // Row-range view: payload rows are contiguous, so this is a pure pointer
 // view — no copy. A 128-ALIGNED row_start re-anchors the scale grid exactly
 // (local row r's true block is row_start/128 + r/128, which is what the

@@ -1140,7 +1140,7 @@ void QwenLayerStream::set_ngram_prestage(bool on) { g_ngram_prestage = on; }
 bool QwenLayerStream::ngram_prestage() { return g_ngram_prestage; }
 // Bit 8: the NVFP4 experts' activation scales live in the layer image (a
 // resident image written without them is rebuilt, not misread).
-uint64_t QwenLoaderFamily::loader_format() {
+uint64_t QwenLoaderFamily::loader_format(const Config&) {
   return (g_dense_weights_fp8 ? 2 : 1) | (g_mtp_experts_bf16_fused ? 4 : 0) | 8;
 }
 

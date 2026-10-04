@@ -24,6 +24,7 @@
 #include "kernels/fp8_per_tensor.hpp"
 #include "kernels/fp8_dequant.hpp"
 #include "kernels/gemm.hpp"
+#include "kernels/glm_moe_launch.hpp"
 #include "kernels/kernels.hpp"
 #include "kernels/mma_gemv.hpp"
 #include "kernels/qwen_mtp.hpp"
@@ -324,8 +325,15 @@ Qwen35Model::Qwen35Model(const Qwen35TextConfig& cfg, const std::string& checkpo
   // requantize every layer's MLP once at boot (dequant to the bridge, then
   // absmax + x/448 quantize). Streaming stacks keep the bridge: their
   // layers are not all resident, so there is nothing eager to build from.
-  pt_enabled_ = prefill_fp8_per_tensor_ && loader_.residency() == LoaderResidency::Resident;
-  pt_attn_enabled_ = pt_enabled_;
+  // Under the NVFP4 mixed release the MLPs are fp4 (no recipe) or BF16
+  // (the draft) with eight channel-fp8 stragglers that bridge fine, so
+  // the MLP slots are Fp8Block-only; the attention recipe carries over
+  // (grid dequant for the channel form, direct maxabs for the BF16 draft).
+  local_inter_ = geo.local_inter;
+  const bool mixed = cfg_.quant_kind == Qwen35QuantKind::Nvfp4Mixed;
+  pt_enabled_ = prefill_fp8_per_tensor_ && loader_.residency() == LoaderResidency::Resident &&
+                !mixed;
+  pt_attn_enabled_ = prefill_fp8_per_tensor_ && loader_.residency() == LoaderResidency::Resident;
   if (pt_enabled_) {
     const size_t IH = I * H;
     pt_slots_ = cfg_.num_hidden_layers + (mtp_ ? 1 : 0);
@@ -343,13 +351,15 @@ Qwen35Model::Qwen35Model(const Qwen35TextConfig& cfg, const std::string& checkpo
       const Qwen35LayerResident& r = loader_.load_layer(cfg_.mtp_layer());
       requant_mlp_pt(pt_slots_ - 1, r.mlp, stream_);
     }
-    // The same recipe for the attention projections: GDN in_proj_qkv [C,
-    // H] + in_proj_z [LV, H] + out_proj [H, LV] per GDN ordinal; Full q
-    // [QW, H] + k/v [KW, H] + o [H, FH] per full ordinal (the MTP draft
-    // layer takes the last full slot). The bridge is idle at boot, so it
-    // stages each dequant like the MLP requant above.
-    if (pt_attn_enabled_)
-    {
+  }
+  // The same recipe for the attention projections: GDN in_proj_qkv [C,
+  // H] + in_proj_z [LV, H] + out_proj [H, LV] per GDN ordinal; Full q
+  // [QW, H] + k/v [KW, H] + o [H, FH] per full ordinal (the MTP draft
+  // layer takes the last full slot). The bridge is idle at boot, so it
+  // stages each dequant like the MLP requant above. The activation
+  // scratch is shared by both recipes (sized by the MLP's I, the wider).
+  if (pt_attn_enabled_)
+  {
       const int64_t lk = geo.local_key_heads, lv = geo.local_value_heads;
       const int64_t K = cfg_.gdn_key_head_dim, V = cfg_.gdn_value_head_dim;
       pt_gdn_C_ = 2 * lk * K + lv * V;
@@ -385,14 +395,20 @@ Qwen35Model::Qwen35Model(const Qwen35TextConfig& cfg, const std::string& checkpo
         const Qwen35LayerResident& r = loader_.load_layer(cfg_.mtp_layer());
         requant_full_pt(num_full_, r.full, stream_);
       }
-    }
-    DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+      DGPP_CUDA_OK(cudaMalloc(&pt_act_, M * I));
+      DGPP_CUDA_OK(cudaMalloc(&pt_act_scales_, 2 * 4));
   }
+  if (pt_enabled_ || pt_attn_enabled_)
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
   // Blockwise-FP8 lm head (engine.dense_weights = fp8, Resident only): the 248k-row BF16
   // head is the only multi-GB BF16 weight left on the decode path. Host
   // requant (fp8_quant::encode_block128, the loader's own encoder) once;
   // decode rows read half the bytes through the F32 scale-GEMM path.
-  head_fp8_enabled_ = dense_weights_fp8_ && loader_.residency() == LoaderResidency::Resident;
+  // The mixed release's head is channel fp8 from the loader already
+  // (mixed_head_): no boot requant, no BF16 fallback.
+  head_fp8_enabled_ = dense_weights_fp8_ && loader_.residency() == LoaderResidency::Resident &&
+                      !mixed;
+  mixed_head_ = mixed;
   if (head_fp8_enabled_) {
     const int64_t V = lm_vocab_count_, Hh = cfg_.hidden_size;
     const int64_t sr = (V + 127) / 128, sc = (Hh + 127) / 128;
@@ -507,8 +523,28 @@ void Qwen35Model::pack_companions() {
       pack(dfw_.fc + t * static_cast<size_t>(dH) * static_cast<size_t>(dH), dH, dH);
     pack(dfw_.hidden_projection, dfcfg_.selector_rank, dH);
   }
-  if (mtp_) pack(globals_.mtp_fc, H, 2 * H);
-  if (!head_fp8_enabled_) pack(globals_.lm_head, lm_vocab_count_, H);
+  if (mtp_) {
+    pack(globals_.mtp_fc, H, 2 * H);
+    // The mixed release's draft ships BF16 projections and MLP (the fp8
+    // release keeps those quantized): pack them the same way.
+    if (mixed_head_) {
+      const Qwen35LocalGeometry& geo = loader_.geometry();
+      const Qwen35LayerResident& r = loader_.load_layer(cfg_.mtp_layer());
+      const int64_t d = cfg_.head_dim;
+      const int64_t QW = 2 * geo.local_heads * d, KW = geo.local_kv_heads * d,
+                   FH = geo.local_heads * d, li = geo.local_inter;
+      pack(r.full.q_proj, QW, H);
+      pack(r.full.k_proj, KW, H);
+      pack(r.full.v_proj, KW, H);
+      pack(r.full.o_proj, H, FH);
+      pack(r.mlp.gate, li, H);
+      pack(r.mlp.up, li, H);
+      pack(r.mlp.down, H, li);
+    }
+  }
+  // The BF16 head's companion only exists where a BF16 head does (the
+  // mixed release's head is channel fp8 from the loader).
+  if (!head_fp8_enabled_ && !mixed_head_) pack(globals_.lm_head, lm_vocab_count_, H);
   bf12_.finish(gemm_, 1);
   bf12_s_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   bf12_.log_summary(rank_, bf12_s_);
@@ -607,8 +643,9 @@ void Qwen35Model::build_layer_objects(const Qwen35LayerResident& r) {
   }
 }
 
-// One GDN slot's boot requant: dequant each blockwise matrix to the bridge,
-// then absmax + x/448 quantize into the slot.
+// One GDN slot's boot requant: dequant each matrix (the matrix's own scale
+// grid — 7/7 blocks, 0/log2(k) the mixed release's channel form) to the
+// bridge, then absmax + x/448 quantize into the slot.
 void Qwen35Model::requant_gdn_pt(int slot, const QwenGdnResident& w, cudaStream_t stream) {
   const size_t H = static_cast<size_t>(cfg_.hidden_size);
   const size_t C = static_cast<size_t>(pt_gdn_C_), LV = static_cast<size_t>(pt_gdn_LV_);
@@ -627,8 +664,10 @@ void Qwen35Model::requant_gdn_pt(int slot, const QwenGdnResident& w, cudaStream_
   };
   for (int t = 0; t < 3; ++t) {
     const int n = tasks[t].n, k = tasks[t].k;
+    int rs = 7, cs = 7;
+    quant_scale_log2(*tasks[t].src, rs, cs);
     launch_fp8_dequant_blocks(tasks[t].src->payload, tasks[t].src->scales, gw_.dequant, n, k,
-                              stream);
+                              stream, rs, cs);
     float* mx = pt_gdn_scales_ + static_cast<size_t>(slot) * 3 + t;
     launch_fp8_row_maxabs(gw_.dequant, static_cast<size_t>(n) * k, mx, stream);
     launch_fp8_quant_bf16(gw_.dequant, tasks[t].dst, static_cast<size_t>(n) * k, mx, stream);
@@ -636,32 +675,44 @@ void Qwen35Model::requant_gdn_pt(int slot, const QwenGdnResident& w, cudaStream_
 }
 
 // One Full slot's boot requant: q/k/v off the hidden rows, o over them.
+// Under the mixed release the MTP draft (the last slot) ships BF16, so a
+// task with a BF16 source skips the dequant and quantizes straight off
+// the resident weight.
 void Qwen35Model::requant_full_pt(int slot, const QwenFullAttnResident& w, cudaStream_t stream) {
   const size_t H = static_cast<size_t>(cfg_.hidden_size);
   const size_t QW = static_cast<size_t>(pt_full_QW_), KW = static_cast<size_t>(pt_full_KW_),
                FH = static_cast<size_t>(pt_full_FH_);
   struct Task {
     const GlmQuantMatrix* src;
+    const uint16_t* bf16;  // the BF16 source when set (the mixed draft)
     uint8_t* dst;
     int n, k;
   };
   const Task tasks[4] = {
-      {&w.q_proj_fp8, pt_full_q_ + static_cast<size_t>(slot) * QW * H, static_cast<int>(QW),
-       static_cast<int>(H)},
-      {&w.k_proj_fp8, pt_full_k_ + static_cast<size_t>(slot) * KW * H, static_cast<int>(KW),
-       static_cast<int>(H)},
-      {&w.v_proj_fp8, pt_full_v_ + static_cast<size_t>(slot) * KW * H, static_cast<int>(KW),
-       static_cast<int>(H)},
-      {&w.o_proj_fp8, pt_full_o_ + static_cast<size_t>(slot) * H * FH, static_cast<int>(H),
-       static_cast<int>(FH)},
+      {&w.q_proj_fp8, w.q_proj, pt_full_q_ + static_cast<size_t>(slot) * QW * H,
+       static_cast<int>(QW), static_cast<int>(H)},
+      {&w.k_proj_fp8, w.k_proj, pt_full_k_ + static_cast<size_t>(slot) * KW * H,
+       static_cast<int>(KW), static_cast<int>(H)},
+      {&w.v_proj_fp8, w.v_proj, pt_full_v_ + static_cast<size_t>(slot) * KW * H,
+       static_cast<int>(KW), static_cast<int>(H)},
+      {&w.o_proj_fp8, w.o_proj, pt_full_o_ + static_cast<size_t>(slot) * H * FH,
+       static_cast<int>(H), static_cast<int>(FH)},
   };
   for (int t = 0; t < 4; ++t) {
     const int n = tasks[t].n, k = tasks[t].k;
-    launch_fp8_dequant_blocks(tasks[t].src->payload, tasks[t].src->scales, gw_.dequant, n, k,
-                              stream);
+    const uint16_t* src;
+    if (tasks[t].bf16) {
+      src = tasks[t].bf16;
+    } else {
+      int rs = 7, cs = 7;
+      quant_scale_log2(*tasks[t].src, rs, cs);
+      launch_fp8_dequant_blocks(tasks[t].src->payload, tasks[t].src->scales, gw_.dequant, n, k,
+                                stream, rs, cs);
+      src = gw_.dequant;
+    }
     float* mx = pt_full_scales_ + static_cast<size_t>(slot) * 4 + t;
-    launch_fp8_row_maxabs(gw_.dequant, static_cast<size_t>(n) * k, mx, stream);
-    launch_fp8_quant_bf16(gw_.dequant, tasks[t].dst, static_cast<size_t>(n) * k, mx, stream);
+    launch_fp8_row_maxabs(src, static_cast<size_t>(n) * k, mx, stream);
+    launch_fp8_quant_bf16(src, tasks[t].dst, static_cast<size_t>(n) * k, mx, stream);
   }
 }
 
@@ -754,6 +805,20 @@ void Qwen35Model::head_gemv(const uint16_t* act, float* out, int rows, cudaStrea
   // MMA): ~5ms at small row counts, half the BF16 bytes. Past 128 rows the
   // blockwise dense kernel falls behind BF16 Lt (58ms vs 26ms at m=500,
   // measured), so wide heads (group walks, diagnostics) keep BF16.
+  // The mixed release's channel-fp8 head, straight from the loader: the
+  // F32 scale-GEMM at every row count — the GEMV/mma forms at decode rows,
+  // the streaming mma at prefill width (that head has no BF16 fallback for
+  // the wide-row diagnostics route, and the grid's streaming form replaces
+  // the bridge: one kernel, no chunked-dequant dance).
+  if (mixed_head_) {
+    const GlmQuantMatrix& h = globals_.lm_head_fp8;
+    int rs = 7, cs = 7;
+    quant_scale_log2(h, rs, cs);
+    launch_scale_gemm_f32(act, static_cast<size_t>(H), h.payload, h.scales, out, rows,
+                          static_cast<int>(V), H, stream, static_cast<size_t>(V),
+                          /*mma_from_rows=*/5, false, gemm_ws_, gemm_ws_bytes_, -1, rs, cs);
+    return;
+  }
   if (head_fp8_enabled_ && rows <= 128) {
     launch_scale_gemm_f32(act, static_cast<size_t>(H), head_fp8_, head_scales_, out, rows,
                           static_cast<int>(V), H, stream, static_cast<size_t>(V),
@@ -767,9 +832,70 @@ void Qwen35Model::head_gemv(const uint16_t* act, float* out, int rows, cudaStrea
 void Qwen35Model::dense_mlp(const uint16_t* x, uint16_t* out, int tokens,
                             const Qwen35DenseMlpResident& m, cudaStream_t stream, int layer,
                             bool resume) {
-  // I is this rank's MLP slice (the resident gate rows): intermediate_size /
-  // world under TP, the whole at world 1.
-  const int64_t H = cfg_.hidden_size, I = m.gate_fp8.rows;
+  // I is this rank's MLP slice: the resident gate rows under FP8, the fp4
+  // matrix's rows under NVFP4, and the loader geometry's local_inter for
+  // the BF16 form (intermediate_size / world under TP, the whole at world 1).
+  const int64_t H = cfg_.hidden_size;
+  const int64_t I = m.form == Qwen35MlpForm::Fp8    ? m.gate_fp8.rows
+                    : m.form == Qwen35MlpForm::Nvfp4 ? m.gate_fp4.rows
+                                                     : local_inter_;
+  // The mixed release's NVFP4 backbone MLPs: W4A16 streaming MMA off the
+  // bf16 activations — the same launchers the MoE stack's dense shells use.
+  // Boot-fixed bump pointers, so this replays under CUDA graphs.
+  if (m.form == Qwen35MlpForm::Nvfp4) {
+    const bool dbg4 = std::getenv("DGPP_QWEN35_TRACE") != nullptr;
+    const auto peek4 = [&](const char* what, const uint16_t* dptr, size_t n) {
+      if (!dbg4) return;
+      DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+      std::vector<uint16_t> h(std::min<size_t>(n, 4096));
+      DGPP_CUDA_OK(cudaMemcpy(h.data(), dptr, h.size() * 2, cudaMemcpyDeviceToHost));
+      double s = 0, mx = 0;
+      for (uint16_t v : h) {
+        const uint32_t b = static_cast<uint32_t>(v) << 16;
+        float f;
+        std::memcpy(&f, &b, 4);
+        s += double(f) * f;
+        mx = std::max(mx, std::fabs(double(f)));
+      }
+      std::fprintf(stderr, "[trace4] %s rms %.4g max %.4g\n", what, std::sqrt(s / double(h.size())),
+                   mx);
+    };
+    peek4("mlp in", x, static_cast<size_t>(tokens) * H);
+    launch_dense_mma_fp4_bf16(x, static_cast<size_t>(H), m.gate_fp4, gate_tmp_, tokens,
+                              static_cast<int>(I), static_cast<int>(H), stream);
+    peek4("mlp gate fp4", gate_tmp_, static_cast<size_t>(tokens) * I);
+    launch_dense_mma_fp4_bf16(x, static_cast<size_t>(H), m.up_fp4, up_tmp_, tokens,
+                              static_cast<int>(I), static_cast<int>(H), stream);
+    peek4("mlp up fp4", up_tmp_, static_cast<size_t>(tokens) * I);
+    qwen35_swiglu_bf16(gate_tmp_, up_tmp_, gate_tmp_, static_cast<int64_t>(tokens) * I, stream);
+    peek4("mlp swiglu", gate_tmp_, static_cast<size_t>(tokens) * I);
+    launch_dense_mma_fp4_bf16(gate_tmp_, static_cast<size_t>(I), m.down_fp4, out, tokens,
+                              static_cast<int>(H), static_cast<int>(I), stream);
+    peek4("mlp down fp4", out, static_cast<size_t>(tokens) * H);
+    if (dbg4) {
+      float gsv[3] = {0, 0, 0};
+      DGPP_CUDA_OK(cudaMemcpy(gsv, m.gate_fp4.global_scale, 4, cudaMemcpyDeviceToHost));
+      DGPP_CUDA_OK(cudaMemcpy(gsv + 1, m.up_fp4.global_scale, 4, cudaMemcpyDeviceToHost));
+      DGPP_CUDA_OK(cudaMemcpy(gsv + 2, m.down_fp4.global_scale, 4, cudaMemcpyDeviceToHost));
+      std::fprintf(stderr, "[trace4] H %lld I %lld gs %.6g %.6g %.6g\n", (long long)H, (long long)I,
+                   gsv[0], gsv[1], gsv[2]);
+    }
+    return;
+  }
+  // The mixed release's MTP draft MLP: BF16, the standard matmul path.
+  if (m.form == Qwen35MlpForm::Bf16) {
+    gemm_.matmul(x, m.gate, gate_tmp_, tokens, static_cast<int>(I), static_cast<int>(H),
+                 DType::BF16, GemmOut::BF16, static_cast<size_t>(H), gemm_ws_, gemm_ws_bytes_,
+                 stream);
+    gemm_.matmul(x, m.up, up_tmp_, tokens, static_cast<int>(I), static_cast<int>(H),
+                 DType::BF16, GemmOut::BF16, static_cast<size_t>(H), gemm_ws_, gemm_ws_bytes_,
+                 stream);
+    qwen35_swiglu_bf16(gate_tmp_, up_tmp_, gate_tmp_, static_cast<int64_t>(tokens) * I, stream);
+    gemm_.matmul(gate_tmp_, m.down, out, tokens, static_cast<int>(H), static_cast<int>(I),
+                 DType::BF16, GemmOut::BF16, static_cast<size_t>(I), gemm_ws_, gemm_ws_bytes_,
+                 stream);
+    return;
+  }
   // Per-tensor FP8 recipe: one shared activation quantize over the H rows
   // feeds both gate and up; the swiglu output is quantized once for down.
   // All addresses are boot-fixed (slots, scratch, scale cells), so the
@@ -801,30 +927,46 @@ void Qwen35Model::dense_mlp(const uint16_t* x, uint16_t* out, int tokens,
   // streaming tile kernel owning ~70% of a 2K prefill at ~24 TFLOP/s, while
   // the bridge scratch (178MB) sat unused by this direct caller.
   if (tokens > 128 && gw_.dequant) {
+    // The matrices' own scale grids (7/7 blocks; 0/log2(k) the mixed
+    // release's eight channel-fp8 straggler MLPs).
+    int grs = 7, gcs = 7, urs = 7, ucs = 7, drs = 7, dcs = 7;
+    quant_scale_log2(m.gate_fp8, grs, gcs);
+    quant_scale_log2(m.up_fp8, urs, ucs);
+    quant_scale_log2(m.down_fp8, drs, dcs);
     const size_t up_bytes = static_cast<size_t>(I) * static_cast<size_t>(H) * 2;
     const size_t down_bytes = static_cast<size_t>(H) * static_cast<size_t>(I) * 2;
     if (up_bytes <= gw_.dequant_bytes && down_bytes <= gw_.dequant_bytes) {
-      launch_fp8_dequant_blocks(m.gate_fp8.payload, m.gate_fp8.scales, gw_.dequant, I, H, stream);
+      launch_fp8_dequant_blocks(m.gate_fp8.payload, m.gate_fp8.scales, gw_.dequant, I, H, stream,
+                                grs, gcs);
       gw_.gemm->matmul(x, gw_.dequant, gate_tmp_, tokens, static_cast<int>(I), static_cast<int>(H),
                        DType::BF16, GemmOut::BF16, static_cast<size_t>(H), gw_.ws, gw_.ws_bytes,
                        stream);
-      launch_fp8_dequant_blocks(m.up_fp8.payload, m.up_fp8.scales, gw_.dequant, I, H, stream);
+      launch_fp8_dequant_blocks(m.up_fp8.payload, m.up_fp8.scales, gw_.dequant, I, H, stream,
+                                urs, ucs);
       gw_.gemm->matmul(x, gw_.dequant, up_tmp_, tokens, static_cast<int>(I), static_cast<int>(H),
                        DType::BF16, GemmOut::BF16, static_cast<size_t>(H), gw_.ws, gw_.ws_bytes,
                        stream);
       qwen35_swiglu_bf16(gate_tmp_, up_tmp_, gate_tmp_, static_cast<int64_t>(tokens) * I, stream);
-      launch_fp8_dequant_blocks(m.down_fp8.payload, m.down_fp8.scales, gw_.dequant, H, I, stream);
+      launch_fp8_dequant_blocks(m.down_fp8.payload, m.down_fp8.scales, gw_.dequant, H, I, stream,
+                                drs, dcs);
       gw_.gemm->matmul(gate_tmp_, gw_.dequant, out, tokens, static_cast<int>(H), static_cast<int>(I),
                        DType::BF16, GemmOut::BF16, static_cast<size_t>(I), gw_.ws, gw_.ws_bytes,
                        stream);
       return;
     }
   }
-  launch_scale_gemm_bf16(x, static_cast<size_t>(H), m.gate_fp8.payload, m.gate_fp8.scales, gate_tmp_,
-                         tokens, static_cast<int>(I), static_cast<int>(H), stream, 0, gw_.mma_from_rows);
-  launch_scale_gemm_bf16(x, static_cast<size_t>(H), m.up_fp8.payload, m.up_fp8.scales, up_tmp_, tokens,
-                         static_cast<int>(I), static_cast<int>(H), stream, 0, gw_.mma_from_rows);
-  qwen35_swiglu_bf16(gate_tmp_, up_tmp_, gate_tmp_, static_cast<int64_t>(tokens) * I, stream);
+  {
+    int grs = 7, gcs = 7, urs = 7, ucs = 7, drs = 7, dcs = 7;
+    quant_scale_log2(m.gate_fp8, grs, gcs);
+    quant_scale_log2(m.up_fp8, urs, ucs);
+    quant_scale_log2(m.down_fp8, drs, dcs);
+    launch_scale_gemm_bf16(x, static_cast<size_t>(H), m.gate_fp8.payload, m.gate_fp8.scales, gate_tmp_,
+                           tokens, static_cast<int>(I), static_cast<int>(H), stream, 0,
+                           gw_.mma_from_rows, nullptr, 0, grs, gcs);
+    launch_scale_gemm_bf16(x, static_cast<size_t>(H), m.up_fp8.payload, m.up_fp8.scales, up_tmp_, tokens,
+                           static_cast<int>(I), static_cast<int>(H), stream, 0, gw_.mma_from_rows,
+                           nullptr, 0, urs, ucs);
+    qwen35_swiglu_bf16(gate_tmp_, up_tmp_, gate_tmp_, static_cast<int64_t>(tokens) * I, stream);
   // The down projection's k = I = 17408 fits one activation row in the GEMV's
   // 48 KiB staging budget, so a 3-row MTP pass read this 89 MB matrix three
   // times (nsys 2026-10-03: 199 single-row launches x 373 us = 74 ms of a
@@ -833,9 +975,10 @@ void Qwen35Model::dense_mlp(const uint16_t* x, uint16_t* out, int tokens,
   // verify stay bitwise (4/4 transcripts); it takes the C1 MTP pass from 197
   // to 151 ms and costs the 1-row T=1 step 8 ms (119 vs 111: the form streams
   // this matrix at ~215 GB/s against the GEMV's 240 — a kernel item).
-  launch_scale_gemm_bf16(gate_tmp_, static_cast<size_t>(I), m.down_fp8.payload, m.down_fp8.scales, out,
-                         tokens, static_cast<int>(H), static_cast<int>(I), stream, 0,
-                         std::min(gw_.mma_from_rows, 1));
+    launch_scale_gemm_bf16(gate_tmp_, static_cast<size_t>(I), m.down_fp8.payload, m.down_fp8.scales, out,
+                           tokens, static_cast<int>(H), static_cast<int>(I), stream, 0,
+                           std::min(gw_.mma_from_rows, 1), nullptr, 0, drs, dcs);
+  }
 }
 
 size_t Qwen35Model::session_snapshot_bytes(const Qwen35TextConfig& cfg, int world, bool mtp) {
@@ -924,10 +1067,16 @@ MemoryPlan Qwen35Model::plan_memory(const Qwen35TextConfig& cfg, int max_tokens,
   // Per-tensor FP8 recipe (engine.prefill_fp8_per_tensor, Resident only):
   // boot-time E4M3 gate/up/down per layer plus one scale each, activation
   // scratch. Streaming stacks keep the bridge (nothing eager to build).
+  // Under the NVFP4 mixed release the MLPs are fp4 or BF16 (no recipe; the
+  // eight channel-fp8 stragglers bridge), so the MLP slots exist only for
+  // the FP8 block release — the attention recipe and the shared activation
+  // scratch carry over.
   if (prefill_fp8_per_tensor_ && residency == LoaderResidency::Resident) {
-    const size_t slots = static_cast<size_t>(cfg.num_hidden_layers) + (mtp ? 1 : 0);
-    const size_t IH = static_cast<size_t>(cfg.intermediate_size) * cfg.hidden_size;
-    plan.add("per-tensor fp8 mlp (gate/up/down E4M3 + scales)", 3 * slots * IH + slots * 3 * 4);
+    if (cfg.quant_kind != Qwen35QuantKind::Nvfp4Mixed) {
+      const size_t slots = static_cast<size_t>(cfg.num_hidden_layers) + (mtp ? 1 : 0);
+      const size_t IH = static_cast<size_t>(cfg.intermediate_size) * cfg.hidden_size;
+      plan.add("per-tensor fp8 mlp (gate/up/down E4M3 + scales)", 3 * slots * IH + slots * 3 * 4);
+    }
     plan.add("per-tensor fp8 activation scratch", M * I + 8);
   }
   if (prefill_fp8_per_tensor_ && residency == LoaderResidency::Resident) {
@@ -951,8 +1100,10 @@ MemoryPlan Qwen35Model::plan_memory(const Qwen35TextConfig& cfg, int max_tokens,
              full_slots * (QW * Hp + 2 * KW * Hp + Hp * FH) + full_slots * 4 * 4);
   }
   // Blockwise-FP8 lm head (engine.dense_weights = fp8, Resident only): half
-  // the bytes per decode row.
-  if (dense_weights_fp8_ && residency == LoaderResidency::Resident) {
+  // the bytes per decode row. The mixed release's head is channel fp8 from
+  // the loader (inside the resident-weights plan; no boot transform).
+  if (dense_weights_fp8_ && residency == LoaderResidency::Resident &&
+      cfg.quant_kind != Qwen35QuantKind::Nvfp4Mixed) {
     const size_t Vv = static_cast<size_t>(cfg.vocab_size), Hh = static_cast<size_t>(cfg.hidden_size);
     plan.add("blockwise fp8 lm head (E4M3 + scales)", Vv * Hh + ((Vv + 127) / 128) * ((Hh + 127) / 128) * 4);
   }
@@ -973,8 +1124,22 @@ MemoryPlan Qwen35Model::plan_memory(const Qwen35TextConfig& cfg, int max_tokens,
       packed += dfcfg->target_layer_ids.size() * Bf12Companions::planned_bytes(dH, dH);
       packed += Bf12Companions::planned_bytes(dfcfg->selector_rank, dH);
     }
-    if (mtp) packed += Bf12Companions::planned_bytes(H, 2 * H);
-    if (!(dense_weights_fp8_ && residency == LoaderResidency::Resident))
+    if (mtp) {
+      packed += Bf12Companions::planned_bytes(H, 2 * H);
+      // The mixed release's BF16 draft projections and MLP.
+      if (cfg.quant_kind == Qwen35QuantKind::Nvfp4Mixed) {
+        const int64_t d = cfg.head_dim;
+        const int64_t lh = static_cast<int64_t>(cfg.num_attention_heads) / world,
+                     lkv = static_cast<int64_t>(cfg.num_key_value_heads) / world;
+        packed += Bf12Companions::planned_bytes(2 * lh * d, H) +
+                  2 * Bf12Companions::planned_bytes(lkv * d, H) +
+                  Bf12Companions::planned_bytes(H, lh * d) +
+                  2 * Bf12Companions::planned_bytes(I, H) +
+                  Bf12Companions::planned_bytes(H, I);
+      }
+    }
+    if (!(dense_weights_fp8_ && residency == LoaderResidency::Resident) &&
+        cfg.quant_kind != Qwen35QuantKind::Nvfp4Mixed)
       packed += Bf12Companions::planned_bytes(cfg.vocab_size, H);  // the head serves in bf16
     plan.add("bf16 decode packing (12-bit companions; the bf16 bytes stay)", packed);
   }
@@ -1247,6 +1412,24 @@ Qwen35Model::Outputs Qwen35Model::run_rows(const RowRun& run) {
   const int32_t* d_req = in.req_ids;
   const int32_t* d_spans = in.spans;
   embed_gather_bf16(globals_.embed, tokens, resid_, T, H, stream_);
+  const bool dbg35 = std::getenv("DGPP_QWEN35_TRACE") != nullptr;
+  const auto trace35 = [&](const char* what, const uint16_t* dptr, size_t n) {
+    if (!dbg35) return;
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+    std::vector<uint16_t> h(std::min<size_t>(n, 4096));
+    DGPP_CUDA_OK(cudaMemcpy(h.data(), dptr, h.size() * 2, cudaMemcpyDeviceToHost));
+    double s = 0, mx = 0;
+    for (size_t i = 0; i < h.size(); ++i) {
+      const uint32_t b = static_cast<uint32_t>(h[i]) << 16;
+      float f;
+      std::memcpy(&f, &b, 4);
+      s += double(f) * f;
+      mx = std::max(mx, std::fabs(double(f)));
+    }
+    std::fprintf(stderr, "[trace35] %s rms %.4g max %.4g first %04x %04x\n", what,
+                 std::sqrt(s / double(h.size())), mx, h[0], h[1]);
+  };
+  trace35("embed resid", resid_, static_cast<size_t>(T) * H);
   Outputs out;
   // The boundary folds (world > 1): the attention / GDN output and the MLP
   // output are this rank's partial sums over its heads and its MLP slice;
@@ -1340,8 +1523,10 @@ Qwen35Model::Outputs Qwen35Model::run_rows(const RowRun& run) {
       ++full_ord;
     }
     fold(ao, H);
+    trace35("layer attn_out", ao, static_cast<size_t>(T) * H);
     // Fused residual-add + post norm (bitwise the pair): one launch.
     qwen_add_rmsnorm_bf16(resid_, ao, r.post_norm, x_, T, H, eps, stream_);
+    trace35("layer postnorm x", x_, static_cast<size_t>(T) * H);
     // A resume chunk's short tail takes the per-tensor MLP like the
     // attention resume above; group spans start at pos0 (resume false).
     // Decode/verify walks (run.decode) keep their exact GEMV dispatch.
@@ -1356,6 +1541,8 @@ Qwen35Model::Outputs Qwen35Model::run_rows(const RowRun& run) {
     }
     uint16_t* mo = stage(mlp_out_, H);
     dense_mlp(x_, mo, T, r.mlp, stream_, layer, mlp_resume);
+    trace35("layer mlp out", mo, static_cast<size_t>(T) * H);
+    trace35("layer resid-before-add", resid_, static_cast<size_t>(T) * H);
     fold(mo, H);
     add_inplace_bf16(resid_, mo, static_cast<size_t>(T) * H, stream_);
     if (run.capture_layers) {

@@ -453,7 +453,7 @@ template <class F>
 uint64_t ResidentLayerStream<F>::resident_image_key() const {
   uint64_t h = 1469598103934665603ull;
   h = fnv_mix(h, ResidentImage::kFormatVersion);
-  h = fnv_mix(h, F::loader_format());
+  h = fnv_mix(h, F::loader_format(cfg_));
   h = fnv_mix(h, static_cast<uint64_t>(world_));
   h = fnv_mix(h, static_cast<uint64_t>(rank_));
   h = fnv_mix(h, static_cast<uint64_t>(head_));

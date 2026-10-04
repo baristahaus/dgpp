@@ -223,7 +223,7 @@ struct Dsv41LoaderFamily {
   using PresentMap = std::unordered_map<std::string, Dsv41TensorDesc>;
   struct Builder;  // models/dsv41/loader.cpp
   static const char* who() { return "dsv41 loader"; }
-  static uint64_t loader_format() { return 1; }
+  static uint64_t loader_format(const Config&) { return 1; }
   static int max_layer(const Config& c) { return c.max_layer(); }
   static int main_layers(const Config& c) { return c.num_hidden_layers; }
   static std::vector<Expected> layer_table(const Config& c, int layer) {

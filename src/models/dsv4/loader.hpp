@@ -156,7 +156,7 @@ struct Dsv4LoaderFamily {
   using PresentMap = std::unordered_map<std::string, Dsv4TensorDesc>;
   struct Builder;  // models/dsv4/loader.cpp
   static const char* who() { return "dsv4 loader"; }
-  static uint64_t loader_format() { return 1; }
+  static uint64_t loader_format(const Config&) { return 1; }
   static int max_layer(const Config& c) { return c.max_layer(); }
   static int main_layers(const Config& c) { return c.num_hidden_layers; }
   static std::vector<Expected> layer_table(const Config& c, int layer) { return dsv4_expected_layer_tensors(c, layer); }

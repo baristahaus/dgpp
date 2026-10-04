@@ -90,6 +90,11 @@ void gemm_dense(const QwenGemmWorkspace& g, const uint16_t* act, int64_t act_str
   if (w8.payload) {
     if (w8.rows != n || w8.cols != k)
       throw std::invalid_argument("qwen dense fp8: the matrix's shape disagrees with the product");
+    // The matrix's own scale grid (log2 form): 7/7 the 128 x 128 blocks,
+    // 0/ceil_log2(k) the NVFP4 mixed release's channel form — every
+    // launcher below takes it (quant_matrix.hpp).
+    int rs = 7, cs = 7;
+    quant_scale_log2(w8, rs, cs);
     // Prefill-shaped (above the scale GEMM's GEMV lowering): through the
     // BF16 interface on the dequantized matrix when the bridge holds it.
     const size_t bf16_bytes = static_cast<size_t>(n) * static_cast<size_t>(k) * 2;
@@ -114,7 +119,7 @@ void gemm_dense(const QwenGemmWorkspace& g, const uint16_t* act, int64_t act_str
       return;
     }
     if (m > 128 && g.dequant && bf16_bytes <= g.dequant_bytes) {
-      launch_fp8_dequant_blocks(w8.payload, w8.scales, g.dequant, n, k, stream);
+      launch_fp8_dequant_blocks(w8.payload, w8.scales, g.dequant, n, k, stream, rs, cs);
       gemm_bf16(g, act, act_stride, g.dequant, out, out_type, m, n, k, stream);
       return;
     }
@@ -123,11 +128,12 @@ void gemm_dense(const QwenGemmWorkspace& g, const uint16_t* act, int64_t act_str
     if (out_type == GemmOut::F32)
       launch_scale_gemm_f32(act, static_cast<size_t>(act_stride), w8.payload, w8.scales,
                             static_cast<float*>(out), m, n, k, stream, static_cast<size_t>(n), g.mma_from_rows,
-                            /*last_row_only=*/false, g.ws, g.ws_bytes);
+                            /*last_row_only=*/false, g.ws, g.ws_bytes,
+                            /*compact_row=*/-1, rs, cs);
     else
       launch_scale_gemm_bf16(act, static_cast<size_t>(act_stride), w8.payload, w8.scales,
                              static_cast<uint16_t*>(out), m, n, k, stream, static_cast<size_t>(n), g.mma_from_rows,
-                             g.ws, g.ws_bytes);
+                             g.ws, g.ws_bytes, rs, cs);
     return;
   }
   if (!w) throw std::invalid_argument("qwen dense: null weight");
@@ -479,7 +485,9 @@ void QwenGdnLayer::in_projections(const uint16_t* x, int tokens, cudaStream_t st
       // GEMV takes them (2026-09-29): bitwise the dual launch they replace.
       Fp8GemvProblem p[4];
       p[0].payload = w_.in_proj_qkv_fp8.payload; p[0].scales = w_.in_proj_qkv_fp8.scales; p[0].out = qkv_; p[0].n = C;
+      quant_scale_log2(w_.in_proj_qkv_fp8, p[0].rs, p[0].cs);
       p[1].payload = w_.in_proj_z_fp8.payload; p[1].scales = w_.in_proj_z_fp8.scales; p[1].out = z_; p[1].n = LV;
+      quant_scale_log2(w_.in_proj_z_fp8, p[1].rs, p[1].cs);
       p[2].bf16_weight = w_.in_proj_a; p[2].out = a_; p[2].n = lv_;
       p[3].bf16_weight = w_.in_proj_b; p[3].out = b_; p[3].n = lv_;
       launch_scale_gemv_multi_bf16(p, ab_gemv ? 4 : 2, x, static_cast<size_t>(H), tokens, H, stream);
@@ -950,8 +958,11 @@ void QwenFullAttnLayer::enqueue(const uint16_t* x, int tokens, const QwenQsaRows
     // multi-problem fp8 GEMV (no indexer problem here).
     Fp8GemvProblem p[3];
     p[0].payload = w_.q_proj_fp8.payload; p[0].scales = w_.q_proj_fp8.scales; p[0].out = q_; p[0].n = QW;
+    quant_scale_log2(w_.q_proj_fp8, p[0].rs, p[0].cs);
     p[1].payload = w_.k_proj_fp8.payload; p[1].scales = w_.k_proj_fp8.scales; p[1].out = k_; p[1].n = KW;
+    quant_scale_log2(w_.k_proj_fp8, p[1].rs, p[1].cs);
     p[2].payload = w_.v_proj_fp8.payload; p[2].scales = w_.v_proj_fp8.scales; p[2].out = v_; p[2].n = KW;
+    quant_scale_log2(w_.v_proj_fp8, p[2].rs, p[2].cs);
     launch_scale_gemv_multi_bf16(p, 3, x, static_cast<size_t>(H), T, H, stream);
   } else {
     gemm_dense(g_, x, H, w_.q_proj, w_.q_proj_fp8, q_, GemmOut::BF16, T, QW, H, stream);

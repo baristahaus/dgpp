@@ -64,6 +64,11 @@ enum class QwenTensorRole : uint8_t {
   GptqCodes,
   GptqScales,
   GptqZeros,
+  // The NVFP4 mixed release's channel form (compressed-tensors strategy
+  // "channel"): e4m3 [N, K] payload + BF16 [N, 1] weight_scale — one scale
+  // per weight row, MULTIPLY on dequant (docs/qwen35_nvfp4_mixed_plan.md).
+  ChannelFp8Payload,  // e4m3 [N, K], partner `_scale` (BF16 [N, 1])
+  ChannelFp8Scale,    // BF16 [N, 1]
 };
 
 struct QwenExpectedTensor {
@@ -77,7 +82,7 @@ struct QwenExpectedTensor {
 
   bool quantized() const {
     return role == QwenTensorRole::Fp8Payload || role == QwenTensorRole::Fp4Payload ||
-           role == QwenTensorRole::GptqCodes;
+           role == QwenTensorRole::GptqCodes || role == QwenTensorRole::ChannelFp8Payload;
   }
   size_t numel() const {
     size_t n = 1;

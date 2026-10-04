@@ -70,6 +70,53 @@ inline Qwen35TextConfig tiny_config() {
   return Qwen35TextConfig::parse(*t.root.find("text_config"), t.root.find("quantization_config"));
 }
 
+// The same tiny release in the NVFP4 mixed form (compressed-tensors /
+// modelopt): the backbone MLPs fp4 group-16, layer 3's MLP channel-fp8
+// (one straggler exercises both dense_mlp forms beside the fp4 pair),
+// every attention projection and the lm head channel-fp8, the MTP draft
+// BF16. The parser keys on config_groups (group_1 = the fp4 weights,
+// group_0's targets = the channel exceptions), so the table follows the
+// checkpoint's own scheme.
+inline const char* tiny_mixed_config_json() {
+  return R"json({
+  "architectures": ["Qwen3_5ForConditionalGeneration"], "model_type": "qwen3_5",
+  "language_model_only": true, "tie_word_embeddings": false,
+  "text_config": {
+    "model_type": "qwen3_5_text", "attention_bias": false, "attn_output_gate": true,
+    "bos_token_id": 1, "eos_token_id": 1, "full_attention_interval": 4,
+    "head_dim": 256, "hidden_act": "silu", "hidden_size": 256, "intermediate_size": 512,
+    "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+    "linear_conv_kernel_dim": 4, "linear_key_head_dim": 128, "linear_num_key_heads": 4,
+    "linear_num_value_heads": 8, "linear_value_head_dim": 128, "mamba_ssm_dtype": "float32",
+    "max_position_embeddings": 4096, "mtp_num_hidden_layers": 1, "mtp_use_dedicated_embeddings": false,
+    "num_attention_heads": 4, "num_hidden_layers": 4, "num_key_value_heads": 2,
+    "output_gate_type": "swish", "partial_rotary_factor": 0.25, "rms_norm_eps": 1e-06,
+    "rope_parameters": {"mrope_interleaved": true, "mrope_section": [11, 11, 10],
+                        "partial_rotary_factor": 0.25, "rope_theta": 10000000.0, "rope_type": "default"},
+    "tie_word_embeddings": false, "vocab_size": 512
+  },
+  "quantization_config": {"format": "compressed-tensors", "quant_method": "compressed-tensors",
+    "config_groups": {
+      "group_0": {"targets": ["re:.*self_attn\\..*$", "re:.*layers\\.(3)\\.mlp\\.(gate|up|down)_proj$",
+                               "lm_head.weight"],
+                  "weights": {"dynamic": true, "num_bits": 8, "strategy": "channel",
+                              "symmetric": true, "type": "float"}},
+      "group_1": {"targets": ["re:.*mlp\\.(gate|up|down)_proj\\.weight$"],
+                  "weights": {"dynamic": false, "group_size": 16, "num_bits": 4,
+                              "num_float_and_int_bits": 3, "strategy": "tensor",
+                              "symmetric": true, "type": "float"},
+                  "input_activations": {"dynamic": true, "group_size": null, "num_bits": 16,
+                                         "strategy": "token", "symmetric": true, "type": "float"}}
+    }
+  }
+})json";
+}
+
+inline Qwen35TextConfig tiny_mixed_config() {
+  const auto t = dgpp::minijson::parse(tiny_mixed_config_json());
+  return Qwen35TextConfig::parse(*t.root.find("text_config"), t.root.find("quantization_config"));
+}
+
 inline bool has(const std::string& name, const char* needle) {
   return name.find(needle) != std::string::npos;
 }
@@ -97,6 +144,37 @@ inline std::vector<uint8_t> tensor_bytes(const QwenExpectedTensor& e) {
         // 6e-4 puts the dequantized weights at the ~0.05 rms of the
         // release's projections.
         v = 4.0e-4f + 2.0e-4f * (0.5f * (rng.unit() + 1.0f));
+        break;
+      case QwenTensorRole::ChannelFp8Payload: {
+        uint8_t b = static_cast<uint8_t>(rng.next() & 0xFFu);  // random e4m3 codes again
+        if ((b & 0x7Fu) == 0x7Fu) b = static_cast<uint8_t>(b & 0xF0u);
+        out[i] = b;
+        continue;
+      }
+      case QwenTensorRole::ChannelFp8Scale:
+        // Same calibration as the block scales: the dequant lands at the
+        // release's ~0.05 rms.
+        v = 4.0e-4f + 2.0e-4f * (0.5f * (rng.unit() + 1.0f));
+        break;
+      case QwenTensorRole::Fp4Payload:
+        // Any byte is a valid pair of e2m1 codes (no NaNs in e2m1).
+        out[i] = static_cast<uint8_t>(rng.next() & 0xFFu);
+        continue;
+      case QwenTensorRole::Fp4Scale: {
+        // e4m3 codes 0x4C..0x4F, the 6 .. 7.5 band (exp field 9): random
+        // e2m1 nibbles have an rms of 2.93 (the 16 signed values span
+        // -6 .. 6), and the kernels multiply by the global (the loader
+        // slots its reciprocal), so scale 6.76 x global 2e-3 puts the
+        // dequantized fp4 weights at the ~0.04 rms of the release's
+        // projections (e2m1 x scale x global, the max element ~0.09).
+        out[i] = static_cast<uint8_t>(0x4Cu | (rng.next() & 0x03u));
+        continue;
+      }
+      case QwenTensorRole::Fp4Global:
+        v = 2.0e-3f;  // the release's small multiply-form global (weight_scale_2)
+        break;
+      case QwenTensorRole::InputScale:
+        v = 1.0f;  // note-read and discarded by the loader
         break;
       default:
         if (is_norm) v = 0.1f * rng.unit();                 // the zero-centered (1 + w) form
@@ -133,9 +211,10 @@ inline std::vector<QwenExpectedTensor> ignored_extras() {
   return out;
 }
 
-// Writes `dir` (config.json + one safetensors shard) for the tiny release.
-inline void write_fixture(const std::string& dir) {
-  const Qwen35TextConfig cfg = tiny_config();
+// Writes `dir` (config.json + one safetensors shard) for the tiny release —
+// the FP8 block form, or the NVFP4 mixed form when `mixed`.
+inline void write_fixture_impl(const std::string& dir, bool mixed) {
+  const Qwen35TextConfig cfg = mixed ? tiny_mixed_config() : tiny_config();
   fs::path root(dir);
   fs::remove_all(root);
   fs::create_directories(root);
@@ -143,7 +222,7 @@ inline void write_fixture(const std::string& dir) {
     const fs::path p = root / "config.json";
     std::FILE* f = std::fopen(p.c_str(), "wb");
     if (!f) throw std::runtime_error("cannot write config.json");
-    const char* json = tiny_config_json();
+    const char* json = mixed ? tiny_mixed_config_json() : tiny_config_json();
     std::fwrite(json, 1, std::strlen(json), f);
     std::fclose(f);
   }
@@ -178,8 +257,11 @@ inline void write_fixture(const std::string& dir) {
   std::fwrite(header.data(), 1, hlen, f);
   std::fwrite(data.data(), 1, data.size(), f);
   std::fclose(f);
-  std::printf("qwen35 fixture written: %zu tensors, %.2f MB payload\n", table.size(),
-              static_cast<double>(data.size()) / 1048576.0);
+  std::printf("qwen35 fixture written (%s): %zu tensors, %.2f MB payload\n", mixed ? "nvfp4 mixed" : "fp8 block",
+              table.size(), static_cast<double>(data.size()) / 1048576.0);
 }
+
+inline void write_fixture(const std::string& dir) { write_fixture_impl(dir, false); }
+inline void write_mixed_fixture(const std::string& dir) { write_fixture_impl(dir, true); }
 
 }  // namespace qwen35fx

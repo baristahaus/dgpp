@@ -243,10 +243,14 @@ void launch_scale_gemm(const uint16_t* act, size_t act_row_stride_elems,
                        const uint8_t* w_payload, const float* w_scales,
                        OutT* out, int m, int n, int k, cudaStream_t stream,
                        size_t out_stride, int mma_from_rows, bool last_row_only = false,
-                       void* ws = nullptr, size_t ws_bytes = 0, int compact_row = -1) {
+                       void* ws = nullptr, size_t ws_bytes = 0, int compact_row = -1,
+                       int rs = 7, int cs = 7) {
   if (m <= 0 || n <= 0) return;  // empty output by definition
   if (!act || !w_payload || !w_scales || !out)
     throw std::invalid_argument("scale_gemm: null pointer");
+  if (rs < 0 || rs > 7 || cs < 4 || cs > 15)
+    throw std::invalid_argument(
+        "scale_gemm: rs must be 0..7 and cs 4..15 (channel per-row through 128 blocks)");
   if (out_stride == 0) out_stride = static_cast<size_t>(n);
   if (out_stride < static_cast<size_t>(n))
     throw std::invalid_argument("scale_gemm: output row stride narrower than n");
@@ -283,10 +287,10 @@ void launch_scale_gemm(const uint16_t* act, size_t act_row_stride_elems,
     }
     if constexpr (std::is_same_v<OutT, float>)
       launch_mma_gemv_fp8_f32(act, act_row_stride_elems, w_payload, w_scales, out, m, n, k,
-                              out_stride, 7, 7, stream, ws, ws_bytes);
+                              out_stride, rs, cs, stream, ws, ws_bytes);
     else
       launch_mma_gemv_fp8_bf16(act, act_row_stride_elems, w_payload, w_scales, out, m, n, k,
-                               out_stride, 7, 7, stream, ws, ws_bytes);
+                               out_stride, rs, cs, stream, ws, ws_bytes);
     return;
   }
   // Small-M calls take the row-independent bandwidth GEMV (the tile below
@@ -320,7 +324,7 @@ void launch_scale_gemm(const uint16_t* act, size_t act_row_stride_elems,
           act + static_cast<size_t>(row0) * act_row_stride_elems,
           act_row_stride_elems, w_payload, w_scales,
           out + static_cast<size_t>(row0) * out_stride, rows, n, k, out_stride,
-          stream);
+          stream, rs, cs);
       row0 += rows;
     }
     return;
@@ -330,15 +334,16 @@ void launch_scale_gemm(const uint16_t* act, size_t act_row_stride_elems,
   // weights and the same ascending-k16 mma chain), with the weight tile
   // decoded once per 128 rows instead of once per 16 (the dense MLP
   // layers' 2048-row GEMMs: 9.7 ms a call on the tile kernel). k % 16 != 0
-  // stays on the tile kernel.
-  if (k % 16 == 0) {
+  // stays on the tile kernel. The 128-grid-only form: a non-default grid
+  // (the NVFP4 release's channel) keeps the tile kernel below.
+  if (k % 16 == 0 && rs == 7 && cs == 7) {
     launch_dense_mma(act, act_row_stride_elems, w_payload, w_scales, out, m, n,
                      k, out_stride, stream);
     return;
   }
   const dim3 grid((n + BN - 1) / BN, (m + BM - 1) / BM);
   scale_gemm_kernel<OutT><<<grid, kBlockThreads, 0, stream>>>(
-      act, act_row_stride_elems, w_payload, w_scales, out, m, n, k, out_stride, 7, 7);
+      act, act_row_stride_elems, w_payload, w_scales, out, m, n, k, out_stride, rs, cs);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
@@ -355,8 +360,13 @@ void launch_scale_gemm_grid(const uint16_t* act, size_t act_row_stride_elems,
   if (m <= 0 || n <= 0) return;
   if (!act || !w_payload || !w_scales || !out)
     throw std::invalid_argument("scale_gemm_grid: null pointer");
-  if (rs < 5 || rs > 7 || cs < 5 || cs > 7)
-    throw std::invalid_argument("scale_gemm_grid: rs / cs must be 5..7 (32 .. 128 blocks)");
+  // rs = 0 (per-row scales, the NVFP4 release's channel form) through 7
+  // (128); cs from the 16-byte-chunk floor 4 through 15 (a channel width's
+  // ceil_log2). The three consumers index scales[(n >> rs) * cols + (k >>
+  // cs)] generically; the old 5..7 pair was the dsv41-era range check.
+  if (rs < 0 || rs > 7 || cs < 4 || cs > 15)
+    throw std::invalid_argument(
+        "scale_gemm_grid: rs must be 0..7 and cs 4..15 (channel per-row through 128 blocks)");
   if (out_stride == 0) out_stride = static_cast<size_t>(n);
   if (out_stride < static_cast<size_t>(n))
     throw std::invalid_argument("scale_gemm_grid: output row stride narrower than n");
@@ -502,8 +512,9 @@ void launch_scale_gemv_multi_bf16(const Fp8GemvProblem* problems, int n_problems
     if (p.out_stride == 0) p.out_stride = static_cast<size_t>(p.n);
     if (p.out_stride < static_cast<size_t>(p.n))
       throw std::invalid_argument("scale_gemv_multi: output row stride narrower than n");
-    if (!bf16 && (p.rs < 5 || p.rs > 7 || p.cs < 4 || p.cs > 7))
-      throw std::invalid_argument("scale_gemv_multi: a problem's scale grid must be 32..128 rows, 16..128 cols");
+    if (!bf16 && (p.rs < 0 || p.rs > 7 || p.cs < 4 || p.cs > 15))
+      throw std::invalid_argument(
+          "scale_gemv_multi: a problem's scale grid must be per-row through 128 rows, 16..32768 cols");
     base.p[i] = p;
     blocks += (p.n + base.span - 1) / base.span;
     base.block_end[i] = blocks;
@@ -527,20 +538,22 @@ void launch_scale_gemm_bf16(const uint16_t* act, size_t act_row_stride_elems,
                             const uint8_t* w_payload, const float* w_scales,
                             uint16_t* out, int m, int n, int k,
                             cudaStream_t stream, size_t out_row_stride_elems, int mma_from_rows,
-                            void* ws, size_t ws_bytes) {
+                            void* ws, size_t ws_bytes, int rs, int cs) {
   launch_scale_gemm<uint16_t>(act, act_row_stride_elems, w_payload, w_scales,
                               out, m, n, k, stream, out_row_stride_elems, mma_from_rows,
-                              /*last_row_only=*/false, ws, ws_bytes);
+                              /*last_row_only=*/false, ws, ws_bytes,
+                              /*compact_row=*/-1, rs, cs);
 }
 
 void launch_scale_gemm_f32(const uint16_t* act, size_t act_row_stride_elems,
                            const uint8_t* w_payload, const float* w_scales,
                            float* out, int m, int n, int k,
                            cudaStream_t stream, size_t out_row_stride_elems, int mma_from_rows,
-                           bool last_row_only, void* ws, size_t ws_bytes, int compact_row) {
+                           bool last_row_only, void* ws, size_t ws_bytes, int compact_row,
+                           int rs, int cs) {
   launch_scale_gemm<float>(act, act_row_stride_elems, w_payload, w_scales,
                            out, m, n, k, stream, out_row_stride_elems, mma_from_rows, last_row_only, ws,
-                           ws_bytes, compact_row);
+                           ws_bytes, compact_row, rs, cs);
 }
 
 namespace {
@@ -552,8 +565,9 @@ void launch_scale_gemm_tile(const uint16_t* act, size_t act_row_stride_elems,
   if (m <= 0 || n <= 0) return;
   if (!act || !w_payload || !w_scales || !out || k <= 0)
     throw std::invalid_argument("scale_gemm_tile: null pointer or k <= 0");
-  if (rs < 5 || rs > 7 || cs < 5 || cs > 7)
-    throw std::invalid_argument("scale_gemm_tile: the scale grid must be 32, 64 or 128 on each axis");
+  if (rs < 0 || rs > 7 || cs < 4 || cs > 15)
+    throw std::invalid_argument(
+        "scale_gemm_tile: rs must be 0..7 and cs 4..15 (channel per-row through 128 blocks)");
   const dim3 grid((n + BN - 1) / BN, (m + BM - 1) / BM);
   scale_gemm_kernel<OutT><<<grid, kBlockThreads, 0, stream>>>(
       act, act_row_stride_elems, w_payload, w_scales, out, m, n, k, static_cast<size_t>(n), rs, cs);

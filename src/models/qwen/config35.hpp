@@ -11,6 +11,7 @@
 // partial rotary + MROPE + a per-head output gate), sandwiching a dense
 // SwiGLU MLP, between two RMSNorms. Text-only scope: vision_config is
 // ignored (image requests stay refused until the tower lands).
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -69,6 +70,17 @@ struct Qwen35TextConfig {
 
   // --- weight formats -------------------------------------------------------
   Qwen35QuantKind quant_kind = Qwen35QuantKind::Fp8Block;
+  // Nvfp4Mixed: the main-layer indices whose MLPs are channel-FP8 (the
+  // float-quantized group's `...layers.(56|...|63).mlp.*` targets); every
+  // other main layer's MLP is NVFP4 group 16. The MTP draft is BF16 under
+  // the mixed release (its safetensors file carries no quantized tensors),
+  // so this list only ever names main layers.
+  std::vector<int> channel_mlp_layers;
+  bool mlp_is_channel(int layer) const {
+    if (quant_kind != Qwen35QuantKind::Nvfp4Mixed) return false;
+    return std::find(channel_mlp_layers.begin(), channel_mlp_layers.end(), layer) !=
+           channel_mlp_layers.end();
+  }
 
   static Qwen35TextConfig parse(const minijson::Value& text_config,
                                 const minijson::Value* quantization_config);

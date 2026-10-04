@@ -54,11 +54,16 @@ inline constexpr int kScaleGemmMmaMaxRows = 256;
 // tensor-core form for its split-K partials at a small n (mma_gemv.hpp);
 // nullptr keeps that form unsplit. Within each 128-row launch group, only
 // groups of at most 32 rows split, introducing another numerical boundary.
+// rs / cs (2026-10-26, the NVFP4 mixed release): the scale grid's log2
+// block sizes threaded to every internal form — defaults 7/7 the 128 x 128
+// blocks; the channel form passes 0 / ceil_log2(cols) (one scale per
+// weight row). The 128-row dense kernel only takes the default grid.
 void launch_scale_gemm_bf16(const uint16_t* act, size_t act_row_stride_elems,
                             const uint8_t* w_payload, const float* w_scales,
                             uint16_t* out, int m, int n, int k,
                             cudaStream_t stream, size_t out_row_stride_elems = 0,
-                            int mma_from_rows = 0, void* ws = nullptr, size_t ws_bytes = 0);
+                            int mma_from_rows = 0, void* ws = nullptr, size_t ws_bytes = 0,
+                            int rs = 7, int cs = 7);
 
 // The same product with the fp32 accumulators stored UNROUNDED: out is f32
 // row-major [M, N]. bf16(out_f32[i]) == out_bf16[i] bit for bit — the two
@@ -76,7 +81,7 @@ void launch_scale_gemm_f32(const uint16_t* act, size_t act_row_stride_elems,
                            float* out, int m, int n, int k,
                            cudaStream_t stream, size_t out_row_stride_elems = 0,
                            int mma_from_rows = 0, bool last_row_only = false, void* ws = nullptr,
-                           size_t ws_bytes = 0, int compact_row = -1);
+                           size_t ws_bytes = 0, int compact_row = -1, int rs = 7, int cs = 7);
 
 // The tile kernel regardless of m (the bf16 mma.sync m16n8k16 path the
 // large-m route takes): the reference the grouped tensor-core MoE kernel is

@@ -268,7 +268,7 @@ struct QwenLoaderFamily {
   static const char* who() { return "qwen loader"; }
   // The resident layout's version; the dense stack's form is part of it
   // (a BF16 image can never be restored into an FP8 world).
-  static uint64_t loader_format();
+  static uint64_t loader_format(const Config&);
   static int max_layer(const Config& c) { return c.num_hidden_layers + (c.mtp_layer() >= 0 ? 1 : 0); }
   static int main_layers(const Config& c) { return c.num_hidden_layers; }
   static std::vector<Expected> layer_table(const Config& c, int layer) {

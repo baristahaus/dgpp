@@ -1,5 +1,6 @@
 #include "models/qwen/config35.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
@@ -252,6 +253,49 @@ Qwen35TextConfig Qwen35TextConfig::parse(const minijson::Value& tc,
       if (bits != 4 || group != 16)
         throw std::runtime_error("Qwen3.5 quantization_config.config_groups: only NVFP4 (4-bit, group 16) is implemented");
       c.quant_kind = Qwen35QuantKind::Nvfp4Mixed;
+      // The float-quantized group (group_0) declares the exceptions to the
+      // NVFP4 backbone: attention projections, the lm head, and (on this
+      // release) the last eight MLPs. Its `...layers.(56|...|63).mlp.*`
+      // target is parsed for the channel-MLP layer list — the one place
+      // the binding table must agree with the checkpoint's own scheme.
+      if (const minijson::Value* g0 = groups->find("group_0");
+          g0 != nullptr && g0->is_object()) {
+        const minijson::Value* targets = g0->find("targets");
+        if (targets != nullptr && targets->is_array()) {
+          for (const minijson::Value& tv : targets->items()) {
+            if (!tv.is_string()) continue;
+            const std::string t(tv.as_string());
+            // The release's own form escapes every dot (\.mlp\.), so the
+            // cheap pre-filter must key on the bare name, not ".mlp.".
+            if (t.find("mlp") == std::string::npos) continue;
+            static const std::string kHead = "re:.*layers\\.(";
+            static const std::string kTail = ")\\.mlp\\.(gate|up|down)_proj$";
+            if (t.compare(0, kHead.size(), kHead) != 0 ||
+                t.compare(t.size() - kTail.size(), kTail.size(), kTail) != 0)
+              reject("quantization_config.config_groups.group_0.targets",
+                     "the MLP target '" + t + "' is not the release's layers.(N|...) form");
+            const std::string ids = t.substr(kHead.size(), t.size() - kHead.size() - kTail.size());
+            size_t pos = 0;
+            while (pos <= ids.size()) {
+              const size_t bar = ids.find('|', pos);
+              const std::string one = ids.substr(pos, bar == std::string::npos ? std::string::npos : bar - pos);
+              if (one.empty() || one.size() > 4 ||
+                  !std::all_of(one.begin(), one.end(), [](char ch) { return ch >= '0' && ch <= '9'; }))
+                reject("quantization_config.config_groups.group_0.targets",
+                       "the MLP target '" + t + "' has a non-numeric layer id");
+              const int id = std::atoi(one.c_str());
+              if (id >= c.num_hidden_layers)
+                reject("quantization_config.config_groups.group_0.targets",
+                       "the MLP target names layer " + std::to_string(id) + " past the stack");
+              if (std::find(c.channel_mlp_layers.begin(), c.channel_mlp_layers.end(), id) ==
+                  c.channel_mlp_layers.end())
+                c.channel_mlp_layers.push_back(id);
+              if (bar == std::string::npos) break;
+              pos = bar + 1;
+            }
+          }
+        }
+      }
       return c;
     }
     const std::string method = optional_string(q, "quant_method", "");

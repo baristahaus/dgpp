@@ -18,12 +18,22 @@
 
 namespace dgpp {
 
-// Dense SwiGLU MLP resident (BF16 or block-FP8 weights).
+// Dense SwiGLU MLP resident. The weight form per layer (the loader sets
+// it; the model dispatches on it):
+//   Fp8   — the block release's 128x128 e4m3 grid, or the mixed release's
+//           channel form (one scale per row) in gate/up/down_fp8;
+//   Nvfp4 — group-16 packed e2m1 + e4m3 scales + one f32 global scale per
+//           matrix, in gate/up/down_fp4 (the mixed release's layers 0-55);
+//   Bf16  — the mixed release's MTP draft (gate/up/down).
+enum class Qwen35MlpForm { Fp8, Nvfp4, Bf16 };
+
 struct Qwen35DenseMlpResident {
+  Qwen35MlpForm form = Qwen35MlpForm::Fp8;
   const uint16_t* gate = nullptr;  // BF16 [I, H]
   const uint16_t* up = nullptr;    // BF16 [I, H]
   const uint16_t* down = nullptr;  // BF16 [H, I]
   GlmQuantMatrix gate_fp8, up_fp8, down_fp8;  // dense_weights fp8
+  GlmFp4Matrix gate_fp4, up_fp4, down_fp4;    // the mixed release's NVFP4 MLP
 };
 
 struct Qwen35LayerResident {
@@ -40,7 +50,10 @@ struct Qwen35LayerResident {
 struct Qwen35GlobalsResident {
   const uint16_t* embed = nullptr;       // BF16 [vocab, H]
   const uint16_t* final_norm = nullptr;  // BF16 [H]
-  const uint16_t* lm_head = nullptr;     // BF16 [V/W, H] vocab shard
+  const uint16_t* lm_head = nullptr;     // BF16 [V/W, H] vocab shard (Fp8Block)
+  // The mixed release's head: channel fp8 e4m3 + per-row F32 scales
+  // (lm_head null there — the checkpoint carries no BF16 head).
+  GlmQuantMatrix lm_head_fp8;
   int lm_vocab_begin = 0, lm_vocab_count = 0;
   // MTP draft head (BF16, replicated): fused fc [H, 2H] over
   // cat(pre_fc_norm_embedding(embed), pre_fc_norm_hidden(hidden)) plus the
@@ -75,7 +88,7 @@ struct Qwen35LoaderFamily {
   struct Builder;  // models/qwen/loader35.cpp
   static const char* who();
   // Fresh family: layout version 1 (no old images to be compatible with).
-  static uint64_t loader_format();
+  static uint64_t loader_format(const Config& c);
   static int max_layer(const Config& c);
   static int main_layers(const Config& c);
   static std::vector<Expected> layer_table(const Config& c, int layer);
