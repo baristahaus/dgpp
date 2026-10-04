@@ -163,15 +163,20 @@ inline std::vector<uint8_t> tensor_bytes(const QwenExpectedTensor& e) {
       case QwenTensorRole::Fp4Scale: {
         // e4m3 codes 0x4C..0x4F, the 6 .. 7.5 band (exp field 9): random
         // e2m1 nibbles have an rms of 2.93 (the 16 signed values span
-        // -6 .. 6), and the kernels multiply by the global (the loader
-        // slots its reciprocal), so scale 6.76 x global 2e-3 puts the
-        // dequantized fp4 weights at the ~0.04 rms of the release's
-        // projections (e2m1 x scale x global, the max element ~0.09).
+        // -6 .. 6), and the kernels DIVIDE the finished dot by the global
+        // (the loader slots it direct, the release's convention), so scale
+        // 6.76 / global 495 puts the dequantized fp4 weights at the ~0.04
+        // rms of the release's projections (e2m1 x scale / global).
         out[i] = static_cast<uint8_t>(0x4Cu | (rng.next() & 0x03u));
         continue;
       }
       case QwenTensorRole::Fp4Global:
-        v = 2.0e-3f;  // the release's small multiply-form global (weight_scale_2)
+        // The release's divide form (the real files carry 2752 / 6400 here);
+        // 2.93 x 6.76 / 495 = 0.04 rms. The value's magnitude is the point:
+        // a fixture at ~1.0 cannot tell a reciprocal from its inverse, and
+        // a loader that inverts this one silently scaled the fp4 MLPs by
+        // global^2 on the real release.
+        v = 495.0f;
         break;
       case QwenTensorRole::InputScale:
         v = 1.0f;  // note-read and discarded by the loader
