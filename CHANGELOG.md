@@ -6,6 +6,24 @@ The history by milestone. The dated engineering record in
 
 ## Unreleased
 
+- **Qwen3.8-27B mixed NVFP4 release: it runs, and the node's shape says no
+  to the draft** (2026-10-04): the release's byte forms ported off the
+  files themselves — NVFP4 MLPs (`weight_packed` + e4m3 group-16 scales + a
+  divide-form global of 6400), channel fp8 attention in the eight stragglers
+  (per-row BF16 scales that multiply), the BF16 draft file. The fp4 global
+  had been stored as its reciprocal, which a fixture with ~1.0 globals
+  cannot see: the real release scaled the mixed MLPs by global², the walk
+  froze on one garbage residual and the lm head wrote exact zeros, so the
+  served token was a uniform draw (`qwen35_forward_test --smoke DIR`, the
+  finite/non-flat gate and `DGPP_QWEN35_TRACE`, found it). Serving carried a
+  worse flag bug: `graph_world` (the CUDA-graph knob) was passed as the
+  *fabric* flag, so world 1 with `decode_graph` asked for the resident,
+  vocab-sharded image — the plan approved and the boot died mid-warmup.
+  Measured here: streaming world 1 answers correctly at 0.3–0.6 tok/s (a
+  streamed 20.3 GiB stack crosses PCIe once per token), and the drafting
+  shapes need 20.95 GiB at world 1 or 14.82 GiB device at world 2 against
+  15.28 free. `docs/qwen35_nvfp4_mixed_campaign_2026-10-04.md`.
+
 - **Qwen3.8-27B: the review's follow-ups** (2026-10-03, #84 / #85 / #87):
   the full-attention layers' kernels rewritten (`kernels/full_attn`: a
   query-tiled prefill form — sixteen queries by one head a warp over
